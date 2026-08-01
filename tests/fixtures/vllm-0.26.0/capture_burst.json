@@ -1,0 +1,438 @@
+{
+  "condition": "burst",
+  "vllm_version": "0.26.0",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "endpoint": "http://localhost:8000",
+  "captured_utc": "2026-08-01T21:16:07.793759+00:00",
+  "load": {
+    "concurrency": 16,
+    "max_tokens": 128,
+    "prompt_chars": 118,
+    "requests_completed": 978,
+    "requests_failed": 0
+  },
+  "scrape_interval_s": 0.5,
+  "scrapes": [
+    {
+      "seq": 0,
+      "file": "metrics_burst_000.txt",
+      "wall_us": 1785618937101289,
+      "monotonic_s": 0.0055,
+      "bytes": 55870
+    },
+    {
+      "seq": 1,
+      "file": "metrics_burst_001.txt",
+      "wall_us": 1785618937606905,
+      "monotonic_s": 0.5105,
+      "bytes": 56061
+    },
+    {
+      "seq": 2,
+      "file": "metrics_burst_002.txt",
+      "wall_us": 1785618938111887,
+      "monotonic_s": 1.0169,
+      "bytes": 56068
+    },
+    {
+      "seq": 3,
+      "file": "metrics_burst_003.txt",
+      "wall_us": 1785618938618297,
+      "monotonic_s": 1.5221,
+      "bytes": 56078
+    },
+    {
+      "seq": 4,
+      "file": "metrics_burst_004.txt",
+      "wall_us": 1785618939123498,
+      "monotonic_s": 2.027,
+      "bytes": 56076
+    },
+    {
+      "seq": 5,
+      "file": "metrics_burst_005.txt",
+      "wall_us": 1785618939628364,
+      "monotonic_s": 2.5361,
+      "bytes": 56064
+    },
+    {
+      "seq": 6,
+      "file": "metrics_burst_006.txt",
+      "wall_us": 1785618940137476,
+      "monotonic_s": 3.04,
+      "bytes": 56065
+    },
+    {
+      "seq": 7,
+      "file": "metrics_burst_007.txt",
+      "wall_us": 1785618940641379,
+      "monotonic_s": 3.5457,
+      "bytes": 56067
+    },
+    {
+      "seq": 8,
+      "file": "metrics_burst_008.txt",
+      "wall_us": 1785618941147110,
+      "monotonic_s": 4.0518,
+      "bytes": 56071
+    },
+    {
+      "seq": 9,
+      "file": "metrics_burst_009.txt",
+      "wall_us": 1785618941653181,
+      "monotonic_s": 4.5584,
+      "bytes": 56071
+    },
+    {
+      "seq": 10,
+      "file": "metrics_burst_010.txt",
+      "wall_us": 1785618942159773,
+      "monotonic_s": 5.0636,
+      "bytes": 56072
+    },
+    {
+      "seq": 11,
+      "file": "metrics_burst_011.txt",
+      "wall_us": 1785618942664989,
+      "monotonic_s": 5.569,
+      "bytes": 56083
+    },
+    {
+      "seq": 12,
+      "file": "metrics_burst_012.txt",
+      "wall_us": 1785618943170385,
+      "monotonic_s": 6.0741,
+      "bytes": 56082
+    },
+    {
+      "seq": 13,
+      "file": "metrics_burst_013.txt",
+      "wall_us": 1785618943675452,
+      "monotonic_s": 6.5791,
+      "bytes": 56086
+    },
+    {
+      "seq": 14,
+      "file": "metrics_burst_014.txt",
+      "wall_us": 1785618944180579,
+      "monotonic_s": 7.088,
+      "bytes": 56070
+    },
+    {
+      "seq": 15,
+      "file": "metrics_burst_015.txt",
+      "wall_us": 1785618944689473,
+      "monotonic_s": 7.5939,
+      "bytes": 56069
+    },
+    {
+      "seq": 16,
+      "file": "metrics_burst_016.txt",
+      "wall_us": 1785618945195286,
+      "monotonic_s": 8.104,
+      "bytes": 56069
+    },
+    {
+      "seq": 17,
+      "file": "metrics_burst_017.txt",
+      "wall_us": 1785618945705328,
+      "monotonic_s": 8.6099,
+      "bytes": 56071
+    },
+    {
+      "seq": 18,
+      "file": "metrics_burst_018.txt",
+      "wall_us": 1785618946211333,
+      "monotonic_s": 9.1146,
+      "bytes": 56072
+    },
+    {
+      "seq": 19,
+      "file": "metrics_burst_019.txt",
+      "wall_us": 1785618946716007,
+      "monotonic_s": 9.6197,
+      "bytes": 56083
+    },
+    {
+      "seq": 20,
+      "file": "metrics_burst_020.txt",
+      "wall_us": 1785618947221073,
+      "monotonic_s": 10.1256,
+      "bytes": 56085
+    },
+    {
+      "seq": 21,
+      "file": "metrics_burst_021.txt",
+      "wall_us": 1785618947726935,
+      "monotonic_s": 10.6308,
+      "bytes": 56084
+    },
+    {
+      "seq": 22,
+      "file": "metrics_burst_022.txt",
+      "wall_us": 1785618948232167,
+      "monotonic_s": 11.1376,
+      "bytes": 56072
+    },
+    {
+      "seq": 23,
+      "file": "metrics_burst_023.txt",
+      "wall_us": 1785618948738994,
+      "monotonic_s": 11.6424,
+      "bytes": 56068
+    },
+    {
+      "seq": 24,
+      "file": "metrics_burst_024.txt",
+      "wall_us": 1785618949243745,
+      "monotonic_s": 12.1474,
+      "bytes": 56070
+    },
+    {
+      "seq": 25,
+      "file": "metrics_burst_025.txt",
+      "wall_us": 1785618949748726,
+      "monotonic_s": 12.6509,
+      "bytes": 56086
+    },
+    {
+      "seq": 26,
+      "file": "metrics_burst_026.txt",
+      "wall_us": 1785618950252227,
+      "monotonic_s": 13.1537,
+      "bytes": 56086
+    },
+    {
+      "seq": 27,
+      "file": "metrics_burst_027.txt",
+      "wall_us": 1785618950755034,
+      "monotonic_s": 13.6589,
+      "bytes": 56084
+    },
+    {
+      "seq": 28,
+      "file": "metrics_burst_028.txt",
+      "wall_us": 1785618951260283,
+      "monotonic_s": 14.1714,
+      "bytes": 56085
+    },
+    {
+      "seq": 29,
+      "file": "metrics_burst_029.txt",
+      "wall_us": 1785618951772732,
+      "monotonic_s": 14.6764,
+      "bytes": 56085
+    },
+    {
+      "seq": 30,
+      "file": "metrics_burst_030.txt",
+      "wall_us": 1785618952277803,
+      "monotonic_s": 15.1816,
+      "bytes": 56085
+    },
+    {
+      "seq": 31,
+      "file": "metrics_burst_031.txt",
+      "wall_us": 1785618952782984,
+      "monotonic_s": 15.6879,
+      "bytes": 56082
+    },
+    {
+      "seq": 32,
+      "file": "metrics_burst_032.txt",
+      "wall_us": 1785618953289327,
+      "monotonic_s": 16.1913,
+      "bytes": 56085
+    },
+    {
+      "seq": 33,
+      "file": "metrics_burst_033.txt",
+      "wall_us": 1785618953792653,
+      "monotonic_s": 16.696,
+      "bytes": 56094
+    },
+    {
+      "seq": 34,
+      "file": "metrics_burst_034.txt",
+      "wall_us": 1785618954297325,
+      "monotonic_s": 17.1993,
+      "bytes": 56103
+    },
+    {
+      "seq": 35,
+      "file": "metrics_burst_035.txt",
+      "wall_us": 1785618954800649,
+      "monotonic_s": 17.7041,
+      "bytes": 56102
+    },
+    {
+      "seq": 36,
+      "file": "metrics_burst_036.txt",
+      "wall_us": 1785618955305523,
+      "monotonic_s": 18.2073,
+      "bytes": 56097
+    },
+    {
+      "seq": 37,
+      "file": "metrics_burst_037.txt",
+      "wall_us": 1785618955808677,
+      "monotonic_s": 18.7116,
+      "bytes": 56098
+    },
+    {
+      "seq": 38,
+      "file": "metrics_burst_038.txt",
+      "wall_us": 1785618956312993,
+      "monotonic_s": 19.2146,
+      "bytes": 56098
+    },
+    {
+      "seq": 39,
+      "file": "metrics_burst_039.txt",
+      "wall_us": 1785618956816015,
+      "monotonic_s": 19.7207,
+      "bytes": 56087
+    },
+    {
+      "seq": 40,
+      "file": "metrics_burst_040.txt",
+      "wall_us": 1785618957322063,
+      "monotonic_s": 20.2241,
+      "bytes": 56086
+    },
+    {
+      "seq": 41,
+      "file": "metrics_burst_041.txt",
+      "wall_us": 1785618957825492,
+      "monotonic_s": 20.7297,
+      "bytes": 56090
+    },
+    {
+      "seq": 42,
+      "file": "metrics_burst_042.txt",
+      "wall_us": 1785618958331118,
+      "monotonic_s": 21.2331,
+      "bytes": 56087
+    },
+    {
+      "seq": 43,
+      "file": "metrics_burst_043.txt",
+      "wall_us": 1785618958834463,
+      "monotonic_s": 21.7387,
+      "bytes": 56103
+    },
+    {
+      "seq": 44,
+      "file": "metrics_burst_044.txt",
+      "wall_us": 1785618959340052,
+      "monotonic_s": 22.2425,
+      "bytes": 56088
+    },
+    {
+      "seq": 45,
+      "file": "metrics_burst_045.txt",
+      "wall_us": 1785618959843825,
+      "monotonic_s": 22.7486,
+      "bytes": 56120
+    },
+    {
+      "seq": 46,
+      "file": "metrics_burst_046.txt",
+      "wall_us": 1785618960349933,
+      "monotonic_s": 23.2535,
+      "bytes": 56120
+    },
+    {
+      "seq": 47,
+      "file": "metrics_burst_047.txt",
+      "wall_us": 1785618960854823,
+      "monotonic_s": 23.7587,
+      "bytes": 56119
+    },
+    {
+      "seq": 48,
+      "file": "metrics_burst_048.txt",
+      "wall_us": 1785618961360026,
+      "monotonic_s": 24.265,
+      "bytes": 56113
+    },
+    {
+      "seq": 49,
+      "file": "metrics_burst_049.txt",
+      "wall_us": 1785618961866343,
+      "monotonic_s": 24.7701,
+      "bytes": 56117
+    },
+    {
+      "seq": 50,
+      "file": "metrics_burst_050.txt",
+      "wall_us": 1785618962371489,
+      "monotonic_s": 25.276,
+      "bytes": 56118
+    },
+    {
+      "seq": 51,
+      "file": "metrics_burst_051.txt",
+      "wall_us": 1785618962877413,
+      "monotonic_s": 25.7817,
+      "bytes": 56114
+    },
+    {
+      "seq": 52,
+      "file": "metrics_burst_052.txt",
+      "wall_us": 1785618963383043,
+      "monotonic_s": 26.2875,
+      "bytes": 56120
+    },
+    {
+      "seq": 53,
+      "file": "metrics_burst_053.txt",
+      "wall_us": 1785618963888867,
+      "monotonic_s": 26.7934,
+      "bytes": 56117
+    },
+    {
+      "seq": 54,
+      "file": "metrics_burst_054.txt",
+      "wall_us": 1785618964394678,
+      "monotonic_s": 27.3001,
+      "bytes": 56117
+    },
+    {
+      "seq": 55,
+      "file": "metrics_burst_055.txt",
+      "wall_us": 1785618964901472,
+      "monotonic_s": 27.8051,
+      "bytes": 56116
+    },
+    {
+      "seq": 56,
+      "file": "metrics_burst_056.txt",
+      "wall_us": 1785618965406442,
+      "monotonic_s": 28.3098,
+      "bytes": 56118
+    },
+    {
+      "seq": 57,
+      "file": "metrics_burst_057.txt",
+      "wall_us": 1785618965911172,
+      "monotonic_s": 28.8133,
+      "bytes": 56116
+    },
+    {
+      "seq": 58,
+      "file": "metrics_burst_058.txt",
+      "wall_us": 1785618966414660,
+      "monotonic_s": 29.3162,
+      "bytes": 56138
+    },
+    {
+      "seq": 59,
+      "file": "metrics_burst_059.txt",
+      "wall_us": 1785618966917613,
+      "monotonic_s": 29.8212,
+      "bytes": 56334
+    }
+  ],
+  "note": "Raw /metrics bytes, unmodified. Scrapes taken during load, not after it drained. Server flags are recorded in serve_flags.txt alongside these fixtures."
+}

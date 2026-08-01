@@ -1,0 +1,38 @@
+# Server configuration that produced these fixtures.
+vllm serve Qwen/Qwen2.5-0.5B-Instruct \
+  --gpu-memory-utilization 0.75 \
+  --max-model-len 2048 \
+  --dtype bfloat16 \
+  --port 8000
+
+# Environment required on this box (RTX 3060 Ti, 8GB, driver 595.71.05):
+CUDA_HOME=<venv>/lib/python3.14/site-packages/nvidia/cu13
+PATH=<venv>/bin:$CUDA_HOME/bin:$PATH
+VLLM_USE_FLASHINFER_SAMPLER=0
+
+# Why VLLM_USE_FLASHINFER_SAMPLER=0: flashinfer 0.6.14 bundles CCCL headers
+# that fail to compile against the CUDA 13.3 toolkit shipped in the cu13
+# wheels ("CUDA compiler and CUDA toolkit headers are incompatible").
+# Only the sampling kernels are affected; attention and CUDA graph capture
+# work. Falls back to the native PyTorch sampler. Does not change which
+# metrics /metrics emits, but IS a deviation from a stock install and should
+# be revisited on the H100.
+#
+# gpu-memory-utilization 0.75 (not 0.85): desktop/Chromium hold ~865 MiB, so
+# 0.85 requested 6.5 GiB against 6.29 GiB free and failed at startup.
+
+# ---------------------------------------------------------------------------
+# The `saturated` condition used a SECOND server config, identical except:
+#   --max-num-seqs 4        (driven with 32 concurrent clients)
+#
+# Why: with the default batch size, 391,952 tokens of KV cache gave 191x max
+# concurrency, so 16 concurrent requests never queued and
+# num_requests_waiting stayed 0 across idle/single/burst. A fixture set where
+# the queue-depth signal never leaves zero cannot validate the parser field
+# that matters most. Capping the running batch at 4 forces the excess into
+# the waiting queue: running=4, waiting=28, reason="capacity"=28.
+#
+# KNOWN GAP: vllm:kv_cache_usage_perc reads 0.00 in ALL four conditions --
+# short prompts against a very large cache. That signal is untested by these
+# fixtures and will need a fixture captured with long prompts, or on hardware
+# where the cache is the binding constraint.

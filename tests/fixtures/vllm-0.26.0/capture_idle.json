@@ -1,0 +1,130 @@
+{
+  "condition": "idle",
+  "vllm_version": "0.26.0",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "endpoint": "http://localhost:8000",
+  "captured_utc": "2026-08-01T21:15:09.350437+00:00",
+  "load": {
+    "concurrency": 0,
+    "max_tokens": 128,
+    "prompt_chars": 118,
+    "requests_completed": 0,
+    "requests_failed": 0
+  },
+  "scrape_interval_s": 0.5,
+  "scrapes": [
+    {
+      "seq": 0,
+      "file": "metrics_idle_000.txt",
+      "wall_us": 1785618901218071,
+      "monotonic_s": 0.0031,
+      "bytes": 55444
+    },
+    {
+      "seq": 1,
+      "file": "metrics_idle_001.txt",
+      "wall_us": 1785618901721241,
+      "monotonic_s": 0.5092,
+      "bytes": 55444
+    },
+    {
+      "seq": 2,
+      "file": "metrics_idle_002.txt",
+      "wall_us": 1785618902227393,
+      "monotonic_s": 1.021,
+      "bytes": 55444
+    },
+    {
+      "seq": 3,
+      "file": "metrics_idle_003.txt",
+      "wall_us": 1785618902739158,
+      "monotonic_s": 1.5318,
+      "bytes": 55444
+    },
+    {
+      "seq": 4,
+      "file": "metrics_idle_004.txt",
+      "wall_us": 1785618903250010,
+      "monotonic_s": 2.0408,
+      "bytes": 55444
+    },
+    {
+      "seq": 5,
+      "file": "metrics_idle_005.txt",
+      "wall_us": 1785618903758956,
+      "monotonic_s": 2.5499,
+      "bytes": 55444
+    },
+    {
+      "seq": 6,
+      "file": "metrics_idle_006.txt",
+      "wall_us": 1785618904268016,
+      "monotonic_s": 3.055,
+      "bytes": 55444
+    },
+    {
+      "seq": 7,
+      "file": "metrics_idle_007.txt",
+      "wall_us": 1785618904773188,
+      "monotonic_s": 3.5643,
+      "bytes": 55444
+    },
+    {
+      "seq": 8,
+      "file": "metrics_idle_008.txt",
+      "wall_us": 1785618905282498,
+      "monotonic_s": 4.0726,
+      "bytes": 55444
+    },
+    {
+      "seq": 9,
+      "file": "metrics_idle_009.txt",
+      "wall_us": 1785618905790748,
+      "monotonic_s": 4.5818,
+      "bytes": 55444
+    },
+    {
+      "seq": 10,
+      "file": "metrics_idle_010.txt",
+      "wall_us": 1785618906299988,
+      "monotonic_s": 5.0874,
+      "bytes": 55444
+    },
+    {
+      "seq": 11,
+      "file": "metrics_idle_011.txt",
+      "wall_us": 1785618906805558,
+      "monotonic_s": 5.5953,
+      "bytes": 55444
+    },
+    {
+      "seq": 12,
+      "file": "metrics_idle_012.txt",
+      "wall_us": 1785618907313477,
+      "monotonic_s": 6.1062,
+      "bytes": 55443
+    },
+    {
+      "seq": 13,
+      "file": "metrics_idle_013.txt",
+      "wall_us": 1785618907824440,
+      "monotonic_s": 6.6143,
+      "bytes": 55444
+    },
+    {
+      "seq": 14,
+      "file": "metrics_idle_014.txt",
+      "wall_us": 1785618908332520,
+      "monotonic_s": 7.1237,
+      "bytes": 55444
+    },
+    {
+      "seq": 15,
+      "file": "metrics_idle_015.txt",
+      "wall_us": 1785618908841857,
+      "monotonic_s": 7.6321,
+      "bytes": 55457
+    }
+  ],
+  "note": "Raw /metrics bytes, unmodified. Scrapes taken during load, not after it drained. Server flags are recorded in serve_flags.txt alongside these fixtures."
+}

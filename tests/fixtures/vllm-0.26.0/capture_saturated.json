@@ -1,0 +1,438 @@
+{
+  "condition": "saturated",
+  "vllm_version": "0.26.0",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "endpoint": "http://localhost:8000",
+  "captured_utc": "2026-08-01T21:18:28.855630+00:00",
+  "load": {
+    "concurrency": 32,
+    "max_tokens": 128,
+    "prompt_chars": 118,
+    "requests_completed": 292,
+    "requests_failed": 0
+  },
+  "scrape_interval_s": 0.5,
+  "scrapes": [
+    {
+      "seq": 0,
+      "file": "metrics_saturated_000.txt",
+      "wall_us": 1785619074987035,
+      "monotonic_s": 0.0112,
+      "bytes": 55781
+    },
+    {
+      "seq": 1,
+      "file": "metrics_saturated_001.txt",
+      "wall_us": 1785619075498336,
+      "monotonic_s": 0.5166,
+      "bytes": 55782
+    },
+    {
+      "seq": 2,
+      "file": "metrics_saturated_002.txt",
+      "wall_us": 1785619076003738,
+      "monotonic_s": 1.022,
+      "bytes": 55783
+    },
+    {
+      "seq": 3,
+      "file": "metrics_saturated_003.txt",
+      "wall_us": 1785619076509107,
+      "monotonic_s": 1.5269,
+      "bytes": 55784
+    },
+    {
+      "seq": 4,
+      "file": "metrics_saturated_004.txt",
+      "wall_us": 1785619077014029,
+      "monotonic_s": 2.0324,
+      "bytes": 55781
+    },
+    {
+      "seq": 5,
+      "file": "metrics_saturated_005.txt",
+      "wall_us": 1785619077519528,
+      "monotonic_s": 2.5384,
+      "bytes": 55795
+    },
+    {
+      "seq": 6,
+      "file": "metrics_saturated_006.txt",
+      "wall_us": 1785619078025584,
+      "monotonic_s": 3.0441,
+      "bytes": 55809
+    },
+    {
+      "seq": 7,
+      "file": "metrics_saturated_007.txt",
+      "wall_us": 1785619078531219,
+      "monotonic_s": 3.5496,
+      "bytes": 55798
+    },
+    {
+      "seq": 8,
+      "file": "metrics_saturated_008.txt",
+      "wall_us": 1785619079036769,
+      "monotonic_s": 4.0553,
+      "bytes": 55812
+    },
+    {
+      "seq": 9,
+      "file": "metrics_saturated_009.txt",
+      "wall_us": 1785619079542382,
+      "monotonic_s": 4.5609,
+      "bytes": 55801
+    },
+    {
+      "seq": 10,
+      "file": "metrics_saturated_010.txt",
+      "wall_us": 1785619080048046,
+      "monotonic_s": 5.0665,
+      "bytes": 55815
+    },
+    {
+      "seq": 11,
+      "file": "metrics_saturated_011.txt",
+      "wall_us": 1785619080553614,
+      "monotonic_s": 5.573,
+      "bytes": 55803
+    },
+    {
+      "seq": 12,
+      "file": "metrics_saturated_012.txt",
+      "wall_us": 1785619081060181,
+      "monotonic_s": 6.0788,
+      "bytes": 55818
+    },
+    {
+      "seq": 13,
+      "file": "metrics_saturated_013.txt",
+      "wall_us": 1785619081565956,
+      "monotonic_s": 6.5848,
+      "bytes": 55805
+    },
+    {
+      "seq": 14,
+      "file": "metrics_saturated_014.txt",
+      "wall_us": 1785619082071869,
+      "monotonic_s": 7.0903,
+      "bytes": 55801
+    },
+    {
+      "seq": 15,
+      "file": "metrics_saturated_015.txt",
+      "wall_us": 1785619082577465,
+      "monotonic_s": 7.5962,
+      "bytes": 55817
+    },
+    {
+      "seq": 16,
+      "file": "metrics_saturated_016.txt",
+      "wall_us": 1785619083083343,
+      "monotonic_s": 8.1055,
+      "bytes": 55828
+    },
+    {
+      "seq": 17,
+      "file": "metrics_saturated_017.txt",
+      "wall_us": 1785619083592625,
+      "monotonic_s": 8.6152,
+      "bytes": 55832
+    },
+    {
+      "seq": 18,
+      "file": "metrics_saturated_018.txt",
+      "wall_us": 1785619084102301,
+      "monotonic_s": 9.1246,
+      "bytes": 55829
+    },
+    {
+      "seq": 19,
+      "file": "metrics_saturated_019.txt",
+      "wall_us": 1785619084611745,
+      "monotonic_s": 9.6326,
+      "bytes": 55830
+    },
+    {
+      "seq": 20,
+      "file": "metrics_saturated_020.txt",
+      "wall_us": 1785619085119762,
+      "monotonic_s": 10.1384,
+      "bytes": 55829
+    },
+    {
+      "seq": 21,
+      "file": "metrics_saturated_021.txt",
+      "wall_us": 1785619085625490,
+      "monotonic_s": 10.6423,
+      "bytes": 56028
+    },
+    {
+      "seq": 22,
+      "file": "metrics_saturated_022.txt",
+      "wall_us": 1785619086129370,
+      "monotonic_s": 11.1476,
+      "bytes": 56021
+    },
+    {
+      "seq": 23,
+      "file": "metrics_saturated_023.txt",
+      "wall_us": 1785619086634760,
+      "monotonic_s": 11.6556,
+      "bytes": 56019
+    },
+    {
+      "seq": 24,
+      "file": "metrics_saturated_024.txt",
+      "wall_us": 1785619087142823,
+      "monotonic_s": 12.1613,
+      "bytes": 56020
+    },
+    {
+      "seq": 25,
+      "file": "metrics_saturated_025.txt",
+      "wall_us": 1785619087648402,
+      "monotonic_s": 12.6672,
+      "bytes": 56021
+    },
+    {
+      "seq": 26,
+      "file": "metrics_saturated_026.txt",
+      "wall_us": 1785619088154355,
+      "monotonic_s": 13.1736,
+      "bytes": 56020
+    },
+    {
+      "seq": 27,
+      "file": "metrics_saturated_027.txt",
+      "wall_us": 1785619088660726,
+      "monotonic_s": 13.6803,
+      "bytes": 56017
+    },
+    {
+      "seq": 28,
+      "file": "metrics_saturated_028.txt",
+      "wall_us": 1785619089167389,
+      "monotonic_s": 14.1867,
+      "bytes": 56033
+    },
+    {
+      "seq": 29,
+      "file": "metrics_saturated_029.txt",
+      "wall_us": 1785619089673801,
+      "monotonic_s": 14.6973,
+      "bytes": 56020
+    },
+    {
+      "seq": 30,
+      "file": "metrics_saturated_030.txt",
+      "wall_us": 1785619090184415,
+      "monotonic_s": 15.2117,
+      "bytes": 56028
+    },
+    {
+      "seq": 31,
+      "file": "metrics_saturated_031.txt",
+      "wall_us": 1785619090698863,
+      "monotonic_s": 15.7156,
+      "bytes": 56019
+    },
+    {
+      "seq": 32,
+      "file": "metrics_saturated_032.txt",
+      "wall_us": 1785619091202766,
+      "monotonic_s": 16.2216,
+      "bytes": 56016
+    },
+    {
+      "seq": 33,
+      "file": "metrics_saturated_033.txt",
+      "wall_us": 1785619091708752,
+      "monotonic_s": 16.7289,
+      "bytes": 56016
+    },
+    {
+      "seq": 34,
+      "file": "metrics_saturated_034.txt",
+      "wall_us": 1785619092216059,
+      "monotonic_s": 17.2355,
+      "bytes": 56018
+    },
+    {
+      "seq": 35,
+      "file": "metrics_saturated_035.txt",
+      "wall_us": 1785619092722627,
+      "monotonic_s": 17.7446,
+      "bytes": 56031
+    },
+    {
+      "seq": 36,
+      "file": "metrics_saturated_036.txt",
+      "wall_us": 1785619093231714,
+      "monotonic_s": 18.25,
+      "bytes": 56016
+    },
+    {
+      "seq": 37,
+      "file": "metrics_saturated_037.txt",
+      "wall_us": 1785619093737097,
+      "monotonic_s": 18.7549,
+      "bytes": 56015
+    },
+    {
+      "seq": 38,
+      "file": "metrics_saturated_038.txt",
+      "wall_us": 1785619094241994,
+      "monotonic_s": 19.2609,
+      "bytes": 56016
+    },
+    {
+      "seq": 39,
+      "file": "metrics_saturated_039.txt",
+      "wall_us": 1785619094748000,
+      "monotonic_s": 19.767,
+      "bytes": 56017
+    },
+    {
+      "seq": 40,
+      "file": "metrics_saturated_040.txt",
+      "wall_us": 1785619095254141,
+      "monotonic_s": 20.2722,
+      "bytes": 56016
+    },
+    {
+      "seq": 41,
+      "file": "metrics_saturated_041.txt",
+      "wall_us": 1785619095759344,
+      "monotonic_s": 20.7762,
+      "bytes": 56017
+    },
+    {
+      "seq": 42,
+      "file": "metrics_saturated_042.txt",
+      "wall_us": 1785619096263298,
+      "monotonic_s": 21.2826,
+      "bytes": 56015
+    },
+    {
+      "seq": 43,
+      "file": "metrics_saturated_043.txt",
+      "wall_us": 1785619096769689,
+      "monotonic_s": 21.7881,
+      "bytes": 56017
+    },
+    {
+      "seq": 44,
+      "file": "metrics_saturated_044.txt",
+      "wall_us": 1785619097275247,
+      "monotonic_s": 22.294,
+      "bytes": 56030
+    },
+    {
+      "seq": 45,
+      "file": "metrics_saturated_045.txt",
+      "wall_us": 1785619097781103,
+      "monotonic_s": 22.8001,
+      "bytes": 56018
+    },
+    {
+      "seq": 46,
+      "file": "metrics_saturated_046.txt",
+      "wall_us": 1785619098287202,
+      "monotonic_s": 23.3056,
+      "bytes": 56032
+    },
+    {
+      "seq": 47,
+      "file": "metrics_saturated_047.txt",
+      "wall_us": 1785619098792810,
+      "monotonic_s": 23.8117,
+      "bytes": 56031
+    },
+    {
+      "seq": 48,
+      "file": "metrics_saturated_048.txt",
+      "wall_us": 1785619099298813,
+      "monotonic_s": 24.3199,
+      "bytes": 56033
+    },
+    {
+      "seq": 49,
+      "file": "metrics_saturated_049.txt",
+      "wall_us": 1785619099807078,
+      "monotonic_s": 24.8256,
+      "bytes": 56031
+    },
+    {
+      "seq": 50,
+      "file": "metrics_saturated_050.txt",
+      "wall_us": 1785619100312708,
+      "monotonic_s": 25.3303,
+      "bytes": 56033
+    },
+    {
+      "seq": 51,
+      "file": "metrics_saturated_051.txt",
+      "wall_us": 1785619100817419,
+      "monotonic_s": 25.8348,
+      "bytes": 56021
+    },
+    {
+      "seq": 52,
+      "file": "metrics_saturated_052.txt",
+      "wall_us": 1785619101321879,
+      "monotonic_s": 26.3399,
+      "bytes": 56020
+    },
+    {
+      "seq": 53,
+      "file": "metrics_saturated_053.txt",
+      "wall_us": 1785619101827004,
+      "monotonic_s": 26.8431,
+      "bytes": 56022
+    },
+    {
+      "seq": 54,
+      "file": "metrics_saturated_054.txt",
+      "wall_us": 1785619102330226,
+      "monotonic_s": 27.3503,
+      "bytes": 56022
+    },
+    {
+      "seq": 55,
+      "file": "metrics_saturated_055.txt",
+      "wall_us": 1785619102837401,
+      "monotonic_s": 27.8564,
+      "bytes": 56033
+    },
+    {
+      "seq": 56,
+      "file": "metrics_saturated_056.txt",
+      "wall_us": 1785619103343495,
+      "monotonic_s": 28.3635,
+      "bytes": 56020
+    },
+    {
+      "seq": 57,
+      "file": "metrics_saturated_057.txt",
+      "wall_us": 1785619103850633,
+      "monotonic_s": 28.8671,
+      "bytes": 56022
+    },
+    {
+      "seq": 58,
+      "file": "metrics_saturated_058.txt",
+      "wall_us": 1785619104354268,
+      "monotonic_s": 29.3729,
+      "bytes": 56018
+    },
+    {
+      "seq": 59,
+      "file": "metrics_saturated_059.txt",
+      "wall_us": 1785619104859992,
+      "monotonic_s": 29.8763,
+      "bytes": 56021
+    }
+  ],
+  "note": "Raw /metrics bytes, unmodified. Scrapes taken during load, not after it drained. Server flags are recorded in serve_flags.txt alongside these fixtures."
+}
