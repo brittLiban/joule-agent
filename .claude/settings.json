@@ -6,9 +6,9 @@
         "hooks": [
           {
             "type": "agent",
-            "prompt": "Use the docs-keeper subagent to check whether CLAUDE.md needs updating based on the file that was just changed.",
+            "prompt": "STEP 1 - fast relevance judgment. Decide from the changed file's path and the nature of the change ALONE whether it could plausibly alter what CLAUDE.md says about this project. Do NOT read source files, grep, or explore the repo to make this call. Doc-relevant means: a component was completed, a real design decision or plan deviation was made, or a dependency/interface/scope change landed. NOT doc-relevant: tests, formatting, comments, .gitignore, .claude/ config, lockfiles, or a change whose docs were already reconciled earlier in this same turn. STEP 2 - if NOT doc-relevant, pass immediately and do nothing further; this is the common case and should cost seconds. Only if it IS doc-relevant, require that the docs-keeper subagent has been invoked to reconcile CLAUDE.md, and report what specifically needs reconciling. Bias hard toward passing: a missed doc update is cheap to fix later, a slow hook gets deleted.",
             "timeout": 60,
-            "async": true
+            "statusMessage": "docs relevance check"
           }
         ]
       }
