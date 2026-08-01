@@ -32,7 +32,33 @@ VLLM_USE_FLASHINFER_SAMPLER=0
 # that matters most. Capping the running batch at 4 forces the excess into
 # the waiting queue: running=4, waiting=28, reason="capacity"=28.
 #
-# KNOWN GAP: vllm:kv_cache_usage_perc reads 0.00 in ALL four conditions --
-# short prompts against a very large cache. That signal is untested by these
-# fixtures and will need a fixture captured with long prompts, or on hardware
-# where the cache is the binding constraint.
+# KNOWN GAPS (measured, not assumed):
+#
+# vllm:kv_cache_usage_perc IS exercised but only at the very low end. Observed
+# maxima: idle 0.0, single 0.000408, burst 0.00498, saturated 0.00151 -- i.e.
+# the cache never exceeds ~0.5% utilisation. Short prompts against 391,952
+# tokens of cache. The metric parses and moves; what is unvalidated is its
+# behaviour under memory pressure, which is the regime that actually changes
+# decode behaviour. (An earlier version of this file said "reads 0.00 in all
+# four conditions" -- that was a formatting artifact of printing at two
+# decimal places, and was wrong.)
+#
+# vllm:num_preemptions_total and vllm:estimated_flops_per_gpu_total are flat
+# zero in all four conditions. These are genuinely unexercised: present in the
+# scrape, parseable, but no fixture has ever seen them non-zero.
+#
+# ---------------------------------------------------------------------------
+# H100 CAPTURE CHECKLIST (do not rediscover this on rented time)
+# ---------------------------------------------------------------------------
+# 1. Re-run the four conditions above; metric names may have moved if the vLLM
+#    version differs. Fixtures are per-version by directory for this reason.
+# 2. Close the kv_cache_usage_perc gap: long prompts / large model, driven
+#    until the cache is the binding constraint rather than max-num-seqs.
+#    That is the fixture that validates the high end of the range.
+# 3. Try to exercise vllm:num_preemptions_total -- oversubscribe until vLLM
+#    preempts. Preemption is a pressure signal the controller will want.
+# 4. Check whether vllm:estimated_flops_per_gpu_total populates on datacenter
+#    hardware; it is flat zero here and may be architecture-gated.
+# 5. Re-run verify_energy_agreement under varying load on that GPU. Sensor
+#    cadence and ring depth are per-device; so is counter trustworthiness.
+# 6. Re-check whether VLLM_USE_FLASHINFER_SAMPLER=0 is still needed.
