@@ -1,0 +1,28 @@
+[build-system]
+# >=77: PEP 639 string-form `license` below is not understood by older backends.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "joule-agent"
+version = "0.0.1"
+description = "Single-node tokens-per-joule measurement and optimization for LLM inference servers"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "nvidia-ml-py>=12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+# No [project.scripts] yet -- the `joule` entry point lands with the benchmark
+# CLI (component 6). Until then: python -m joule_agent.telemetry
+
+[tool.setuptools]
+packages = ["joule_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
