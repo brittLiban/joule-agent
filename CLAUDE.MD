@@ -93,6 +93,48 @@ The comparison MUST include, as named baselines (not just "before/after"):
    - **Verification gate: lock EFFICACY still OPEN — and it blocks component 4 being meaningful.** NVML accepting `nvmlDeviceSetGpuLockedClocks` is not evidence the device honoured it; GeForce parts restrict some NVML writes. If the lock is a silent no-op here, every configuration in the static sweep would measure identically and the sweep would look like it ran while proving nothing. `tools/verify_clock_lock.py` settles it behaviourally: sustained load, SM clock sampled across baseline / locked / recovered phases. Unlocked baseline under load on this card is **1935–1950 MHz**, so a lock at 900 MHz is trivially distinguishable. Requires root; not yet run.
    - **Superseded note (unit evidence).** 32 tests cover exception/SIGINT/SIGTERM/SIGKILL paths using real child processes and a fake controller. Mutation-tested: disabling signal handlers makes the SIGTERM case fail, and reordering the state-file write makes the ordering test fail. Note the asymmetry — the **SIGINT** case still passes without handlers, because Python's default `KeyboardInterrupt` unwinds through `__exit__`; **SIGTERM is the case that isolates the handler**. The live on-GPU kill test requires root and has not yet been run.
 
+## Test-suite audit (the verification apparatus itself)
+
+Four consecutive review passes found tests that could not fail — one written
+during the narrowing, and in pass 13 *both* replacement tests were wrong on the
+first attempt. At that point the suite is the least trustworthy part of the
+module, so it was audited directly rather than reviewed again.
+
+**Method.** Two batteries. (1) Stub out each protected-surface function in turn
+(22 of them) and record which tests die; a test killed by nothing is a
+candidate for pinning nothing. (2) For every survivor, hand-write the mutation
+aimed at *what that test claims* and confirm it dies for that reason.
+
+**Result: 112 tests, 93 killed by the blunt battery, 19 survivors, of which 17
+pinned their claim under a targeted mutation and 2 did not.**
+
+- `test_guard_claims_its_controller` asserted only `c.locked == (1400, 1400)` —
+  the write happening, not the claim being taken. It survived `_require_claim`
+  becoming a no-op, i.e. it never pinned its own name.
+- `test_broken_power_restore_is_caught` was scaffolding that proved the suite's
+  own assertions would trip; it survived the guard skipping the restoring power
+  write *entirely*. Replaced by
+  `test_a_silently_refusing_device_is_reported_as_a_clean_restore`, which pins a
+  real documented limit: with no readback, a device that accepts a power write
+  and does nothing is indistinguishable from success, and only the
+  device-verifiable tier of `check_stale_state` can see it.
+
+A static scan for structurally unfalsifiable assertions found 4 more:
+`assert g._handler is g._handler` (trivially true), `check_stale_state(...) is
+not None` (fails only by raising), an `or`-chain where either side satisfied,
+and one premise-pin left implicit. All rewritten and mutation-verified.
+
+**One correction to my own instrument, recorded because it is the same error
+class:** the blunt battery first reported `test_recovery_resets_clocks_even_
+with_no_state_file` as vacuous. It is not — the mutation was badly aimed and
+left `result["reset_clocks"] = True` unconditional. A mutation that does not
+actually break the property proves nothing about the test, exactly as a test
+that cannot fail proves nothing about the code.
+
+**Standing rule.** Mutation-verification shows a test *moves*. It does not show
+the test is sound. Confirm separately that each assertion CAN be false, and
+that the mutation used breaks the specific property named.
+
 ## Review gates
 - Any commit touching `gpu_guard.py`, `sweep.py`, or `controller.py`: run
   hardware-safety-reviewer before committing.

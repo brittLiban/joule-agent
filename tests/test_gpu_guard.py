@@ -274,7 +274,10 @@ def test_state_file_documents_that_clock_lock_is_asserted(tmp_path):
     with guard(tmp_path) as g:
         g.lock_clocks(1400)
     note = record(sp)["_note"]
-    assert "ASSERTED" in note or "asserted" in note.lower()
+    assert "ASSERTED" in note, (
+        f"the record must say the clock lock is asserted, not verified: {note!r}"
+    )
+    assert "VERIFIED" not in note.upper()
 
 
 # ---------------------------------------------------------------------------
@@ -502,19 +505,39 @@ def test_broken_restore_is_caught_by_these_tests(tmp_path):
         assert c.locked is None  # the exact assertion in the clean-exit test
 
 
-def test_broken_power_restore_is_caught(tmp_path):
-    class NoPowerRestore(FakeGpuController):
-        def set_power_limit_mw(self, mw):
-            if mw == 200_000:
-                return  # silently refuse to restore
-            super().set_power_limit_mw(mw)
+def test_a_silently_refusing_device_is_reported_as_a_clean_restore(tmp_path):
+    """A documented limit of the guard, pinned so it cannot drift unnoticed.
 
-    c = NoPowerRestore(power_limit_mw=200_000, power_default_limit_mw=200_000)
-    with guard(tmp_path, controller=c) as g:
+    The device is never read back -- there is no
+    `nvmlDeviceGetGpuLockedClocks` -- so a card that ACCEPTS a power write and
+    silently does nothing is indistinguishable from success. The guard reports
+    restored and clears the record while the cap is still in effect.
+
+    This replaces a test that asserted only that a broken restore would trip
+    the suite's own assertions. It survived a mutation that made the guard skip
+    the power write altogether, so it pinned nothing about the guard.
+    """
+    class SilentlyRefuses(FakeGpuController):
+        def set_power_limit_mw(self, mw):
+            self.set_power_calls += 1
+            if mw == 200_000:
+                return                  # accepted, and quietly ignored
+            self._power = int(mw)
+
+    c = SilentlyRefuses(power_limit_mw=200_000, power_default_limit_mw=200_000)
+    sp = tmp_path / "state.json"
+    with GpuGuard(c, consent=True, require_root=False, state_path=sp) as g:
         g.set_power_limit_mw(120_000)
+
+    # The guard DID issue the restoring write -- that is the part it controls.
+    assert c.set_power_calls == 2, "the guard never attempted the restore"
+    # And it is still capped, with the record saying otherwise. No readback
+    # exists, so this is honest reporting of an unknowable, not a bug.
     assert c.get_power_limit_mw() == 120_000
-    with pytest.raises(AssertionError):
-        assert c.get_power_limit_mw() == 200_000
+    assert record(sp)["restored"] is True
+    assert check_stale_state(c, sp)["verified_power_modified"] is True, (
+        "the one tier that CAN see this must still flag it"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -589,10 +612,25 @@ def test_unclaimed_controller_refuses_direct_writes(tmp_path):
 
 
 def test_guard_claims_its_controller(tmp_path):
+    """The claim is what stops a second writer reaching the same device.
+
+    This test used to assert only `c.locked == (1400, 1400)` -- which is the
+    write happening, not the claim being taken. It survived a mutation that
+    turned `_require_claim` into a no-op, i.e. it never pinned its own name.
+    """
     c = FakeGpuController()
+    assert c._claimed_by is None
     with guard(tmp_path, controller=c) as g:
+        assert c._claimed_by is g, "the guard did not claim the controller"
         g.lock_clocks(1400)
         assert c.locked == (1400, 1400)
+
+        # An unclaimed writer must be refused, and a differently-claimed one too.
+        other = FakeGpuController()
+        with pytest.raises(GpuGuardError):
+            other.set_locked_clocks(1400, 1400)
+        with pytest.raises(GpuGuardError):
+            c.claim("someone-else")
 
 
 def test_power_limit_of_zero_is_still_restored(tmp_path):
@@ -1729,7 +1767,11 @@ def test_reads_still_need_no_consent_after_that_change(tmp_path):
     g.arm()
     assert g.snapshot.name == "FakeGPU"
     assert c.set_clock_calls == 0
-    assert check_stale_state(FakeGpuController(), tmp_path / "s.json") is not None
+    # Not `is not None` -- that can only fail by raising. Assert the read
+    # actually produced the device report a consentless caller is entitled to.
+    rep = check_stale_state(FakeGpuController(), tmp_path / "s.json")
+    assert rep["power_readable"] is True
+    assert rep["device_index"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1782,10 +1824,20 @@ def test_the_stored_handler_is_one_stable_object(tmp_path):
     once-only bug.
     """
     g = guard(tmp_path)
+    # `assert g._handler is g._handler` was trivially true and pinned nothing.
+    # What matters is that the stored object is stable across accesses WHERE A
+    # FRESH BOUND METHOD IS NOT -- so compare the two directly.
     assert g._signal_restore is not g._signal_restore, (
-        "bound methods stopped being per-access; the guard below is moot"
+        "bound methods stopped being per-access; nothing below is meaningful"
     )
-    assert g._handler is g._handler
+    fresh = [g._signal_restore for _ in range(3)]
+    stored = [g._handler for _ in range(3)]
+    assert len(set(map(id, fresh))) == 3, "expected three distinct bound methods"
+    assert len(set(map(id, stored))) == 1, (
+        "_handler is rebuilt per access, so `getsignal(sig) is self._handler` "
+        "can never answer 'is the handler already mine?'"
+    )
+    assert stored[0].__func__ is GpuGuard._signal_restore
     original = signal.getsignal(signal.SIGINT)
     try:
         g._install_handlers()
