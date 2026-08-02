@@ -1724,7 +1724,26 @@ def restore_from_state_file(
 
 
 def _controller(args) -> GpuController:
-    return NvmlGpuController(index=args.gpu)
+    """Open the device, turning NVML's own errors into an operator message.
+
+    A mistyped ``--gpu`` used to surface as a raw ``NVMLError_InvalidArgument``
+    traceback. Nothing unsafe happened -- the device is opened before anything
+    is armed -- but a stack trace is not a usable answer to "there is no GPU 99
+    on this machine", and it is the first thing an operator sees when they get
+    the flag wrong. Found by exercising the CLI against real hardware; the
+    mocked suite never constructs this controller.
+    """
+    try:
+        return NvmlGpuController(index=args.gpu)
+    except GpuGuardError:
+        raise
+    except Exception as exc:
+        raise GpuGuardError(
+            f"Cannot open GPU {args.gpu}: {type(exc).__name__}: {exc}. "
+            "List the devices on this machine with `nvidia-smi "
+            "--query-gpu=index,uuid,name --format=csv` and pass one of those "
+            "indices. Nothing was armed and no device was touched."
+        ) from exc
 
 
 def main(argv=None) -> int:
@@ -1765,9 +1784,12 @@ def main(argv=None) -> int:
     )
 
     args = p.parse_args(argv)
-    c = _controller(args)
     guard = None
+    c = None
     try:
+        # Inside the try: opening the device can fail, and that failure is an
+        # operator message, not a traceback.
+        c = _controller(args)
         if args.cmd == "status":
             rep = check_stale_state(c, args.state_path)
             print(json.dumps(rep, indent=2))
@@ -1818,7 +1840,10 @@ def main(argv=None) -> int:
                 "can still run.",
                 file=sys.stderr,
             )
-        else:
+        elif c is not None:
+            # c is None when opening the device itself failed. There is nothing
+            # to close, and calling close() would replace the operator's real
+            # error with an AttributeError raised from a finally.
             c.close()
     return 0
 

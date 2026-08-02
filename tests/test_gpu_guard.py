@@ -2568,3 +2568,54 @@ def test_a_raise_from_the_handler_does_not_leave_the_signals_blocked(tmp_path):
         "an unwind between applying the mask and entering the try left "
         "SIGINT/SIGTERM blocked for the life of the process"
     )
+
+
+def test_an_unopenable_device_is_an_operator_message_not_a_traceback(tmp_path):
+    """Found by running the CLI against real hardware, not by this suite.
+
+    A mistyped --gpu surfaced as a raw NVMLError traceback. Nothing unsafe
+    happened -- the device is opened before anything is armed -- but a stack
+    trace is not a usable answer to "there is no GPU 99 on this machine", and
+    it is the first thing an operator sees when they get the flag wrong.
+
+    The mocked suite never constructs NvmlGpuController, which is exactly why
+    it missed this and the two `main()`-seam defects before it.
+    """
+    import joule_agent.gpu_guard as gg
+    from joule_agent.gpu_guard import main
+
+    class NoSuchDevice:
+        def __init__(self, index=0):
+            raise RuntimeError("Invalid Argument")
+
+    real = gg.NvmlGpuController
+    gg.NvmlGpuController = NoSuchDevice
+    try:
+        rc = main(["--gpu", "99", "--state-path", str(tmp_path / "s.json"),
+                   "status"])
+    finally:
+        gg.NvmlGpuController = real
+
+    assert rc == 2, f"an unopenable device did not fail loudly: rc={rc}"
+
+
+def test_an_unopenable_device_names_how_to_find_the_right_index(tmp_path, capsys):
+    import joule_agent.gpu_guard as gg
+    from joule_agent.gpu_guard import main
+
+    class NoSuchDevice:
+        def __init__(self, index=0):
+            raise RuntimeError("Invalid Argument")
+
+    real = gg.NvmlGpuController
+    gg.NvmlGpuController = NoSuchDevice
+    try:
+        main(["--gpu", "99", "--state-path", str(tmp_path / "s.json"), "status"])
+    finally:
+        gg.NvmlGpuController = real
+
+    err = capsys.readouterr().err
+    assert "Cannot open GPU 99" in err, err
+    assert "nvidia-smi" in err, "the message does not say how to find a valid index"
+    assert "no device was touched" in err
+    assert "Traceback" not in err

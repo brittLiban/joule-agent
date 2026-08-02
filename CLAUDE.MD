@@ -135,6 +135,26 @@ that cannot fail proves nothing about the code.
 the test is sound. Confirm separately that each assertion CAN be false, and
 that the mutation used breaks the specific property named.
 
+## The CLI seam (where the mocked suite is blind)
+
+`tools/cli_contract_check.py` exercises `python -m joule_agent.gpu_guard` as a
+subprocess against a **real** device, asserting on exit code, message content,
+and what each run left on disk. Run it unprivileged for the refusal paths; run
+it with `sudo -E .venv/bin/python tools/cli_contract_check.py --root` for the
+kill tests, which write real clocks.
+
+**It exists because three defects reached committed code through this seam and
+112 fake-NVML tests saw none of them.** `main()`'s `lock` path enters the
+context manager — which arms, and arming publishes a claim — *before* checking
+consent, and later before checking the clock floor; both left an operator-
+visible record for a caller that was never allowed to write. And a mistyped
+`--gpu` surfaced as a raw `NVMLError` traceback rather than an answer. The unit
+suite constructs `GpuGuard` and `FakeGpuController` directly and never crosses
+into `main()` or `NvmlGpuController`, so none of it was reachable there.
+
+The rule that follows: **every refusal depending only on the arguments or the
+caller — never on the device — must happen before the guard is entered.**
+
 ## Review gates
 - Any commit touching `gpu_guard.py`, `sweep.py`, or `controller.py`: run
   hardware-safety-reviewer before committing.
