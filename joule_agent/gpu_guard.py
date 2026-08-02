@@ -477,7 +477,13 @@ def _write_state(path: Path, state: GuardState) -> None:
 
 
 def _read_record(path: Path) -> dict | None:
-    """Read the record, tolerating the two older on-disk shapes."""
+    """Read the record, tolerating the two older on-disk shapes.
+
+    A file that exists but cannot be parsed is NOT the same as no file. Both
+    return None here, so callers that care must consult :func:`state_unreadable`
+    -- treating an unreadable file as "nothing ever ran" would be a silent
+    no-op on exactly the evidence this module says is the only evidence.
+    """
     try:
         doc = json.loads(Path(path).read_text())
     except Exception:
@@ -495,6 +501,18 @@ def _read_record(path: Path) -> dict | None:
     if "pid" in doc:                         # schema 1: a bare record
         return doc
     return None
+
+
+def state_unreadable(path: Path | str) -> bool:
+    """True if the state file exists but could not be parsed."""
+    path = Path(path)
+    if not path.exists():
+        return False
+    try:
+        json.loads(path.read_text())
+        return False
+    except Exception:
+        return True
 
 
 def _pid_alive(pid) -> bool:
@@ -590,7 +608,17 @@ class GpuGuard:
             return
         pid = prior.get("pid")
         if pid == os.getpid():
-            return
+            # Same pid, unrestored record, and we are not yet armed: that means
+            # a DIFFERENT GpuGuard object in this process holds the device.
+            # (A guard cannot reach here about itself -- _armed is never reset,
+            # so arm() short-circuits after the first call.) Allowing this let a
+            # second guard snapshot the first one's modified state as "stock".
+            raise GuardBusyError(
+                f"Refusing to arm: another GpuGuard in this process (pid {pid}) "
+                f"holds an unrestored record in {self._state_path}. One guard "
+                "per device -- a second would capture the first's modified "
+                "settings as if they were stock, and restore to them."
+            )
         if _pid_alive(pid):
             raise GuardBusyError(
                 f"Refusing to arm: pid {pid} is running and holds an unrestored "
@@ -759,6 +787,14 @@ class GpuGuard:
 
         The clock reset is issued unconditionally rather than gated on a
         readback, because no readback exists.
+
+        **Deliberately has no thread-affinity check.** Every in-repo caller
+        (``__exit__``, ``atexit``, the signal handler) runs on the arming
+        thread, and adding a check would let a restore be REFUSED, which would
+        break the module's whole contract. The premise is therefore documented
+        rather than enforced: do not call this from a worker thread while the
+        owning thread is mid-write -- signal blocking cannot protect against
+        another thread.
         """
         if self._restored:
             return
@@ -865,6 +901,7 @@ def check_stale_state(
     report = {
         "state_file": str(path),
         "state_file_present": path.exists(),
+        "state_file_unreadable": state_unreadable(path),
         "power_readable": False,
         "verified_power_modified": False,
         "asserted_clock_lock": False,
@@ -873,6 +910,14 @@ def check_stale_state(
         "findings": [],
         "recommendation": None,
     }
+
+    if report["state_file_unreadable"]:
+        report["stale"] = True
+        report["findings"].append(
+            "UNREADABLE (state file): the file exists but could not be parsed, "
+            "so the asserted tier could not run. Treat as possibly-modified "
+            "rather than clean."
+        )
 
     # Tier 1: verifiable directly from the device.
     cur = controller.get_power_limit_mw()
@@ -926,11 +971,18 @@ def check_stale_state(
         )
 
     if report["stale"]:
-        report["recommendation"] = (
-            "Run `sudo python -m joule_agent.gpu_guard restore` to return the "
-            "device to stock. Safe even if nothing is actually locked -- the "
-            "clock reset is a no-op on an unlocked GPU."
-        )
+        if report.get("writer_pid_alive"):
+            report["recommendation"] = (
+                "A guard process is STILL RUNNING and owns this record. Prefer "
+                "stopping it -- its own restore will run on exit. Recovery will "
+                "reset the clock but will refuse to clear a live guard's record."
+            )
+        else:
+            report["recommendation"] = (
+                "Run `sudo python -m joule_agent.gpu_guard restore` to return "
+                "the device to stock. Safe even if nothing is actually locked "
+                "-- the clock reset is a no-op on an unlocked GPU."
+            )
     return report
 
 
@@ -990,6 +1042,29 @@ def restore_from_state_file(
             result["power_restored_to_mw"] = int(target)
         except Exception as exc:
             result["errors"].append(f"set_power_limit_mw: {exc}")
+
+    # Do not clear a record a live guard still owns, and do not publish a
+    # read that went stale while the hardware calls above were running. Arming
+    # is refused over a live record precisely because that destroys evidence;
+    # recovery must not do the same destruction silently.
+    if prior is not None:
+        holder = prior.get("pid")
+        if holder and holder != os.getpid() and _pid_alive(holder):
+            result["record_not_cleared_reason"] = (
+                f"pid {holder} is still running and owns this record; the clock "
+                "reset above still applied, but the record is left alone so a "
+                "live guard's evidence is not destroyed. Stop that process (its "
+                "own restore will run) or re-run recovery afterwards."
+            )
+            return result
+        current = _read_record(Path(state_path))
+        if current != prior:
+            result["record_not_cleared_reason"] = (
+                "the state record changed while recovery was running (a guard "
+                "wrote to it); refusing to publish a stale read over it. The "
+                "clock reset above still applied -- re-run recovery."
+            )
+            return result
 
     if prior is not None and not result["errors"]:
         prior = dict(prior)

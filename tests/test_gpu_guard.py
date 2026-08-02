@@ -879,21 +879,6 @@ def test_arming_proceeds_when_the_prior_record_is_restored(tmp_path):
     assert c.locked is None
 
 
-def test_our_own_record_does_not_block_re_arming(tmp_path):
-    """A guard re-arming in the same process must not block on itself."""
-    c = FakeGpuController()
-    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
-    g.arm()
-    g.lock_clocks(1400)          # leaves restored=false for THIS pid
-    g.arm()                      # idempotent, must not raise
-    assert g._armed
-
-
-# ---------------------------------------------------------------------------
-# the same-thread hazard is now closed by construction
-# ---------------------------------------------------------------------------
-
-
 def test_signals_are_blocked_for_the_duration_of_a_hardware_write(tmp_path):
     """Replaces the in-flight bookkeeping that four review passes kept breaking.
 
@@ -948,3 +933,111 @@ def test_a_signal_raised_during_a_write_is_delivered_after_it(tmp_path):
         assert delivered, "the pending signal was swallowed, not deferred"
     finally:
         signal.signal(signal.SIGTERM, original)
+
+
+def test_a_second_guard_in_one_process_is_refused(tmp_path):
+    """The own-pid exemption was unreachable for a single guard (_armed is
+    never reset, so arm() short-circuits) and therefore only ever admitted a
+    SECOND guard object -- which would snapshot the first's modified settings
+    as if they were stock, and 'restore' the device to them.
+    """
+    sp = tmp_path / "state.json"
+    c1 = FakeGpuController(power_limit_mw=200_000, power_default_limit_mw=200_000)
+    c2 = FakeGpuController(power_limit_mw=200_000, power_default_limit_mw=200_000)
+    g1 = GpuGuard(c1, consent=True, require_root=False, state_path=sp)
+    g2 = GpuGuard(c2, consent=True, require_root=False, state_path=sp)
+
+    g1.arm()
+    g1.set_power_limit_mw(120_000)
+
+    with pytest.raises(GuardBusyError, match="another GpuGuard in this process"):
+        g2.arm()
+    assert g2.snapshot is None, "the refused guard captured a snapshot anyway"
+    assert c2.set_power_calls == 0
+
+    g1.restore()
+    assert c1.get_power_limit_mw() == 200_000
+
+
+def test_re_arming_the_same_guard_is_idempotent(tmp_path):
+    """The refusal must not break a guard re-entering arm() via lock_clocks."""
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
+    g.arm()
+    g.lock_clocks(1400)      # leaves restored=false for this pid
+    g.arm()                  # short-circuits on _armed, must not raise
+    g.lock_clocks(1500)      # re-enters arm() internally
+    assert c.locked == (1500, 1500)
+    g.restore()
+
+
+def test_a_fresh_guard_after_a_clean_restore_may_arm(tmp_path):
+    """Single-instance must not wedge sequential use."""
+    sp = tmp_path / "state.json"
+    c1 = FakeGpuController()
+    with GpuGuard(c1, consent=True, require_root=False, state_path=sp) as g1:
+        g1.lock_clocks(1400)
+    c2 = FakeGpuController()
+    with GpuGuard(c2, consent=True, require_root=False, state_path=sp) as g2:
+        g2.lock_clocks(1500)
+        assert c2.locked == (1500, 1500)
+    assert c2.locked is None
+
+
+def test_recovery_refuses_to_clear_a_live_guards_record(tmp_path):
+    """Recovery resets the clock but must not destroy a running guard's
+    evidence -- arming refuses over a live record for exactly this reason."""
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({
+        "schema": 3,
+        "record": {"pid": os.getppid(), "restored": False, "clocks_locked": True,
+                   "locked_min_mhz": 900, "locked_max_mhz": 900, "snapshot": {}},
+    }))
+    c = FakeGpuController()
+    res = restore_from_state_file(c, sp)
+    assert res["reset_clocks"] is True, "the clock reset must still happen"
+    assert res["record_cleared"] is False
+    assert "still running" in res["record_not_cleared_reason"]
+    assert record(sp)["restored"] is False, "a live guard's evidence was erased"
+
+
+def test_recovery_refuses_to_publish_a_stale_read(tmp_path):
+    """If a guard writes while recovery is mid-flight, recovery must not
+    publish the record it read before those hardware calls."""
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({
+        "schema": 3,
+        "record": {"pid": 999999, "restored": False, "clocks_locked": True,
+                   "locked_min_mhz": 900, "locked_max_mhz": 900, "snapshot": {}},
+    }))
+
+    class MutateDuringReset(FakeGpuController):
+        def reset_locked_clocks(self):
+            self._require_claim()
+            self.reset_calls += 1
+            self.locked = None
+            # A guard records new intent while we are resetting.
+            sp.write_text(json.dumps({
+                "schema": 3,
+                "record": {"pid": 999999, "restored": False,
+                           "clocks_locked": True, "locked_min_mhz": 1400,
+                           "locked_max_mhz": 1400, "snapshot": {}},
+            }))
+
+    res = restore_from_state_file(MutateDuringReset(), sp)
+    assert res["reset_clocks"] is True
+    assert res["record_cleared"] is False
+    assert "changed while recovery was running" in res["record_not_cleared_reason"]
+    assert record(sp)["locked_min_mhz"] == 1400, "the newer record was clobbered"
+
+
+def test_unreadable_state_file_is_reported_stale_not_clean(tmp_path):
+    """'The file is the only evidence' -- an unparseable one must not read as
+    'nothing ever ran'."""
+    sp = tmp_path / "state.json"
+    sp.write_text("{ this is not json")
+    rep = check_stale_state(FakeGpuController(), sp)
+    assert rep["state_file_present"] is True
+    assert rep["state_file_unreadable"] is True
+    assert rep["stale"] is True
+    assert any("UNREADABLE" in f for f in rep["findings"])
