@@ -1552,6 +1552,13 @@ def main(argv=None) -> int:
 
         if args.cmd == "lock":
             guard = GpuGuard(c, consent=args.consent, state_path=args.state_path)
+            # Refuse BEFORE entering, because __enter__ arms and arm() publishes
+            # a claim. lock_clocks checks consent before its own auto-arm, but
+            # this path arms first, so without this a caller who was never going
+            # to be allowed to write still leaves a record on disk. arm() itself
+            # deliberately does not check consent: snapshotting is a read, and
+            # reads never require it.
+            guard._check_consent()
             with guard:
                 guard.lock_clocks(args.mhz)
                 print(f"locked SM clock at {args.mhz} MHz; holding {args.hold}s")

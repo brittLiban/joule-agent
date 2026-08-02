@@ -1728,3 +1728,36 @@ def test_a_caller_without_consent_leaves_no_claim_behind(tmp_path):
             call(g)
         assert not sp.exists(), "a consent-refused caller published a claim"
         assert g._armed is False
+
+
+def test_the_cli_lock_refuses_consent_before_it_arms(tmp_path):
+    """Found by running the real CLI, not by a unit test.
+
+    lock_clocks checks consent before its own auto-arm, but `main`'s lock path
+    enters the context manager first -- and __enter__ arms, which publishes a
+    claim. A caller who was never going to be allowed to write left a record on
+    disk; a kill in that window would strand it.
+    """
+    from joule_agent.gpu_guard import main
+
+    sp = tmp_path / "state.json"
+    rc = main(["--gpu", "0", "--state-path", str(sp), "lock", "--mhz", "900",
+               "--hold", "0"])
+    assert rc == 2, "a consentless lock did not fail loudly"
+    assert not sp.exists(), "a consent-refused CLI run published a claim"
+
+
+def test_reads_still_need_no_consent_after_that_change(tmp_path):
+    """Invariant 5 in the direction the fix could have broken.
+
+    The refusal belongs in the CLI's write path, NOT in arm(): snapshotting is
+    a read, and a guard armed without consent must still be able to report the
+    device.
+    """
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=False, require_root=False,
+                 state_path=tmp_path / "s.json")
+    g.arm()
+    assert g.snapshot.name == "FakeGPU"
+    assert c.set_clock_calls == 0
+    assert check_stale_state(FakeGpuController(), tmp_path / "s.json") is not None
