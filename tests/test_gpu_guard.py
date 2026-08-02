@@ -2413,3 +2413,20 @@ def test_a_failed_publish_during_arm_leaves_the_guard_disarmed(tmp_path):
     with pytest.raises(GuardBusyError):
         g.lock_clocks(1400)
     assert c.set_clock_calls == 0, "wrote hardware over another guard's claim"
+
+
+def test_the_cli_lock_refuses_a_bad_clock_before_it_arms(tmp_path):
+    """Found by running the real CLI, like the consent case before it.
+
+    lock_clocks checks the floor before its own auto-arm, but `main`'s lock
+    path enters the context manager first -- and __enter__ arms, which
+    publishes a claim. Every refusal that depends only on the arguments or the
+    caller, never on the device, has to happen before that.
+    """
+    from joule_agent.gpu_guard import main
+
+    sp = tmp_path / "state.json"
+    rc = main(["--gpu", "0", "--state-path", str(sp), "lock", "--mhz", "100",
+               "--hold", "0", CONSENT_FLAG])
+    assert rc == 2, "a below-floor lock did not fail loudly"
+    assert not sp.exists(), "a floor-refused CLI run published a claim"
