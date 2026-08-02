@@ -735,6 +735,16 @@ class GpuGuard:
         self._consent = consent
         self._state_path = Path(state_path)
         self._require_root = require_root
+        if min_clock_mhz < MIN_SM_CLOCK_MHZ:
+            # The floor is a hard floor. A caller may raise it for a particular
+            # device, never lower it -- otherwise min_clock_mhz=0 silently
+            # disables invariant 3, and the refusal it exists to make becomes a
+            # constructor argument.
+            raise ClockFloorError(
+                f"Refusing min_clock_mhz={min_clock_mhz}: the module floor is "
+                f"{MIN_SM_CLOCK_MHZ} MHz and callers may only raise it. "
+                "Lowering it would disable the refusal, not relax it."
+            )
         self._min_clock = min_clock_mhz
 
         self._depth = 0
@@ -891,7 +901,22 @@ class GpuGuard:
     # -- lifecycle -------------------------------------------------------
 
     def arm(self) -> "GpuGuard":
-        """Snapshot stock state and install every restore path."""
+        """Snapshot stock state, install every restore path, publish the claim.
+
+        The claim is published HERE, not at the first hardware write.
+        ``_check_not_busy`` can only see what is on disk, so a record that
+        appears only on first touch leaves a window in which a second process
+        reads a clean file and arms too. Both then hold "stock" snapshots and
+        both write the file wholesale, so the later record erases the earlier
+        one -- and a record saying ``power_limit_written_mw: null`` tells
+        recovery to leave a cap the first guard really did apply.
+
+        ``restored: False`` in that record means *a guard holds this device*,
+        not *the hardware is modified*. Only the first is knowable at arm time;
+        the record's own ``clocks_locked`` and ``power_limit_written_mw`` carry
+        the second, and those are what recovery reads. ``self._restored`` stays
+        ``True`` because there is no hardware debt yet -- see :meth:`restore`.
+        """
         if self._armed:
             return self
         if threading.current_thread() is not threading.main_thread():
@@ -917,29 +942,24 @@ class GpuGuard:
             restored=False,
         )
         self._owner_thread = threading.get_ident()
-        self._install_handlers()
-        # Publish the claim HERE, not at the first hardware write. _check_not_busy
-        # can only see what is on disk, so a record that appears only on first
-        # touch leaves a window in which a second process reads a clean file and
-        # arms too. Both then hold "stock" snapshots and both write the file
-        # wholesale, so the later record erases the earlier one -- and a record
-        # saying power_limit_written_mw: null tells recovery to leave a cap the
-        # first guard really did apply.
+        # Install, arm and publish as ONE step, with signals blocked. A signal
+        # delivered between installing and `_armed = True` runs
+        # _signal_restore -> restore -> _surrender_claim, which uninstalls the
+        # handlers and sets _armed False -- and then the interrupted frame
+        # resumes and sets _armed True again. The guard is left armed with NO
+        # handlers, and because every entry point short-circuits on _armed,
+        # nothing ever reinstalls: the next clock lock runs with no in-process
+        # restore path at all. A signal landing inside _install_handlers is
+        # worse still -- the partial uninstall clears _prev_handlers, and the
+        # resuming loop reinstalls over an empty dict, destroying the
+        # application's handler for that signal.
         #
-        # `restored: False` here means "a guard holds this device", not "the
-        # hardware is modified". Those are different facts and only the first is
-        # knowable at arm time; the record's own clocks_locked and
-        # power_limit_written_mw fields carry the second, and recovery reads
-        # them, so nothing downstream is misled.  self._restored stays True
-        # because there is no hardware debt yet -- see restore().
-        #
-        # _armed is set BEFORE the publish. _write_state can raise (unwritable
-        # cwd, ENOSPC), and handlers are already installed by this point; a
-        # guard left with handlers installed and _armed False would re-enter
-        # _install_handlers on the next call. That is survivable now only
-        # because the handler recording is idempotent -- keep it that way.
-        self._armed = True
-        _write_state(self._state_path, self.state)
+        # No NVML call is issued in here (the snapshot is already taken), so
+        # blocking cannot strand a Ctrl+C behind a hanging driver.
+        with _deferred_signals():
+            self._install_handlers()
+            self._armed = True
+            _write_state(self._state_path, self.state)
         return self
 
     def _install_handlers(self) -> None:
@@ -1028,6 +1048,13 @@ class GpuGuard:
         """
         for sig, prev in list(self._prev_handlers.items()):
             try:
+                if prev is None:
+                    # getsignal returns None for a handler installed from C.
+                    # signal.signal(sig, None) raises TypeError, which would
+                    # leave OUR handler installed over a cleared dict. Leaving
+                    # it installed is the same outcome, minus the exception --
+                    # but say so rather than arriving there by accident.
+                    continue
                 if signal.getsignal(sig) is self._handler:
                     signal.signal(sig, prev)
             except (ValueError, OSError, TypeError):  # pragma: no cover
@@ -1051,10 +1078,21 @@ class GpuGuard:
                 file=sys.stderr,
             )
 
-        try:
-            signal.signal(signum, prev if prev is not None else signal.SIG_DFL)
-        except Exception:
-            pass
+        # Step aside ONLY if the restore actually succeeded. On the failure
+        # path restore() raised, so _uninstall_handlers never ran: the guard is
+        # still armed, the record still says restore_failed, and the GPU is
+        # still modified. Handing this signal back unconditionally meant a
+        # second SIGTERM made no restore attempt at all -- the in-process retry
+        # was removed exactly when the device was known to be modified. Keep
+        # our handler installed and still chain below, so the process dies the
+        # way the sender intended if that is what the previous handler does.
+        if self._restored:
+            try:
+                signal.signal(
+                    signum, prev if prev is not None else signal.SIG_DFL
+                )
+            except Exception:
+                pass
         if prev is signal.SIG_IGN:
             # The process deliberately ignored this signal before we armed.
             # Restoring the GPU is ours to do; killing the process is not.

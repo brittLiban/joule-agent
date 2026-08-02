@@ -2128,3 +2128,199 @@ def test_the_surrender_tail_is_not_re_enterable(tmp_path):
         gg._write_state = real
     assert signal.SIGINT in seen["blocked"], "the surrender tail was interruptible"
     assert signal.SIGTERM in seen["blocked"]
+
+
+# ---------------------------------------------------------------------------
+# Pass 11: findings from the pass-10 protected-surface review.
+# ---------------------------------------------------------------------------
+
+
+def test_a_signal_during_arm_cannot_leave_it_armed_without_handlers(tmp_path):
+    """arm() installs handlers, then sets _armed. A signal in between ran
+    _signal_restore -> restore -> _surrender_claim, which UNINSTALLED and set
+    _armed False -- and then the interrupted frame resumed and set _armed True.
+    Armed with no handlers, and every entry point short-circuits on _armed, so
+    nothing ever reinstalled: the next clock lock had no in-process restore
+    path at all.
+
+    Needs an application handler that RETURNS (the default SIGINT handler
+    raises KeyboardInterrupt and unwinds arm(), so it never triggers).
+    """
+    script = textwrap.dedent(f"""
+        import os, signal, sys
+        sys.path.insert(0, {str(Path.cwd())!r})
+        import joule_agent.gpu_guard as gg
+        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
+
+        seen = []
+        signal.signal(signal.SIGTERM, lambda s, f: seen.append(s))  # returns
+
+        g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path={str(tmp_path / "s.json")!r})
+
+        # Fire from inside _install_handlers -- the real window is between
+        # installing and `_armed = True`. Firing from _write_state would miss
+        # it, because _write_state blocks these signals itself, so delivery is
+        # deferred until after _armed is already set.
+        real = gg.GpuGuard._install_handlers
+        def spy(self):
+            real(self)
+            os.kill(os.getpid(), signal.SIGTERM)
+        gg.GpuGuard._install_handlers = spy
+        try:
+            g.arm()
+        finally:
+            gg.GpuGuard._install_handlers = real
+
+        armed = g._armed
+        installed = signal.getsignal(signal.SIGTERM) is g._handler
+        print("ARMED", armed, "HANDLER", installed, "DELIVERED", len(seen))
+    """)
+    p = subprocess.run([sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=60)
+    out = p.stdout.strip()
+    assert "DELIVERED 1" in out, f"the signal never arrived: {out!r}"
+
+    # The invariant is the conjunction, not either half. Blocking the signal
+    # across install-arm-publish means the handler runs AFTER arm() completes,
+    # so the guard ends up cleanly surrendered (ARMED False, HANDLER False).
+    # What must never happen is armed WITHOUT a handler, because nothing
+    # reinstalls once _armed short-circuits arm().
+    armed = "ARMED True" in out
+    handler = "HANDLER True" in out
+    assert not (armed and not handler), (
+        f"armed with no signal handler installed: {out!r} {p.stderr[-400:]!r}"
+    )
+
+
+def test_a_failed_signal_restore_keeps_its_retry_path(tmp_path):
+    """_signal_restore handed the signal back unconditionally.
+
+    On the failure path restore() raised, so _uninstall_handlers never ran: the
+    guard is still armed, the record says restore_failed, the GPU is still
+    modified. Reinstalling the previous handler anyway meant a second SIGTERM
+    made no restore attempt at all -- the in-process retry removed exactly when
+    the device is known to be modified.
+    """
+    chained = []
+    prev = lambda signum, frame: chained.append(signum)
+    before = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGTERM, prev)
+    try:
+        # fail_restore only declines to clear `locked`; restore() sees no
+        # error and marks itself done. The failure path needs a RAISE.
+        c = RaisingRestore()
+        g = GpuGuard(c, consent=True, require_root=False,
+                     state_path=tmp_path / "state.json")
+        g.arm()
+        g.lock_clocks(1400)
+        assert g._prev_handlers[signal.SIGTERM] is prev
+
+        g._signal_restore(signal.SIGTERM, None)
+
+        assert g._restored is False, "precondition: the restore really failed"
+        assert chained == [signal.SIGTERM], "the chain call did not happen"
+        assert signal.getsignal(signal.SIGTERM) is g._handler, (
+            "gave the signal away while the GPU was still modified"
+        )
+        assert record(tmp_path / "state.json")["restore_failed"] is True
+
+        # And the retry is live: a second delivery tries again.
+        before_calls = c.reset_calls
+        g._signal_restore(signal.SIGTERM, None)
+        assert c.reset_calls > before_calls, "no second restore attempt"
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
+def test_a_successful_signal_restore_does_step_aside(tmp_path):
+    """The other direction: on success the guard must hand the signal back, or
+    a second Ctrl+C would be swallowed forever."""
+    before = signal.getsignal(signal.SIGTERM)
+    sentinel = lambda signum, frame: None
+    signal.signal(signal.SIGTERM, sentinel)
+    try:
+        g = guard(tmp_path)
+        g.arm()
+        g.lock_clocks(1400)
+        g._signal_restore(signal.SIGTERM, None)
+        assert g._restored is True
+        assert signal.getsignal(signal.SIGTERM) is sentinel, (
+            "kept the signal after a clean restore"
+        )
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
+def test_the_clock_floor_cannot_be_lowered_by_a_constructor_argument(tmp_path):
+    """Invariant 3 is a refusal, not a default. min_clock_mhz=0 disabled it."""
+    with pytest.raises(ClockFloorError):
+        GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                 state_path=tmp_path / "s.json", min_clock_mhz=0)
+    with pytest.raises(ClockFloorError):
+        GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                 state_path=tmp_path / "s.json",
+                 min_clock_mhz=MIN_SM_CLOCK_MHZ - 1)
+    # Raising it is allowed -- a device may need a higher floor than the module's.
+    g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                 state_path=tmp_path / "s.json",
+                 min_clock_mhz=MIN_SM_CLOCK_MHZ + 500)
+    with pytest.raises(ClockFloorError):
+        g.lock_clocks(MIN_SM_CLOCK_MHZ + 100)
+
+
+def test_two_armed_guards_terminate_on_a_real_signal(tmp_path):
+    """The chain property, executed rather than asserted structurally.
+
+    Three defects landed here while the only coverage was dict shape. This
+    delivers an actual SIGTERM with two guards armed and requires the process
+    to die rather than recurse.
+    """
+    script = textwrap.dedent(f"""
+        import os, signal, sys
+        sys.path.insert(0, {str(Path.cwd())!r})
+        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
+        a = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path={str(tmp_path / "a.json")!r})
+        b = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path={str(tmp_path / "b.json")!r})
+        a.arm(); a.lock_clocks(1400)
+        b.arm(); b.lock_clocks(1500)
+        a.restore()
+        a.arm(); a.lock_clocks(1400)
+        print("READY", flush=True)
+        os.kill(os.getpid(), signal.SIGTERM)
+        print("SURVIVED", flush=True)
+    """)
+    p = subprocess.run([sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=60)
+    assert "READY" in p.stdout, f"setup failed: {p.stdout!r} {p.stderr[-500:]!r}"
+    assert "RecursionError" not in p.stderr, "the handler chain cycled"
+    assert "SURVIVED" not in p.stdout, "SIGTERM did not terminate the process"
+    assert p.returncode == -signal.SIGTERM, (
+        f"died the wrong way: rc={p.returncode} {p.stderr[-500:]!r}"
+    )
+
+
+def test_the_restore_bookkeeping_tail_is_not_re_enterable(tmp_path):
+    """The surrender tail was pinned in pass 10; restore()'s own tail was not."""
+    import joule_agent.gpu_guard as gg
+
+    seen = []
+    real = gg._write_state
+
+    def spy(path, state):
+        seen.append(signal.pthread_sigmask(signal.SIG_BLOCK, []))
+        return real(path, state)
+
+    g = guard(tmp_path)
+    g.arm()
+    g.lock_clocks(1400)
+    gg._write_state = spy
+    try:
+        g.restore()
+    finally:
+        gg._write_state = real
+    assert seen, "restore() wrote no record"
+    assert signal.SIGINT in seen[-1], "restore's bookkeeping tail was interruptible"
+    assert signal.SIGTERM in seen[-1]
