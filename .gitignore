@@ -8,3 +8,6 @@ dist/
 
 # Recorded telemetry runs are local measurement artifacts, not source.
 runs/
+
+# Guard state + benchmark outputs are runtime artifacts.
+results/
