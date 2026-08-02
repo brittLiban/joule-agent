@@ -32,7 +32,11 @@ Two constraints are enforced rather than defended against:
   one recovers through its state file, the documented hard-kill path, not
   in-process. The guard does not chain to any other handler -- see
   :meth:`GpuGuard._install_handlers` for why that capability was removed
-  rather than repaired.
+  rather than repaired. Note the consequence for a DISARMED guard: nothing
+  uninstalls, so its handler can still be the one a signal reaches, and it
+  will restore itself (a no-op) and terminate while another guard's clock
+  lock is left to state-file recovery. Once any guard has armed, these two
+  signals belong to gpu_guard for the life of the process.
 
 This is a narrowing, and it was chosen on evidence. Four review passes of an
 earlier design found 27 defects; the large majority lived in machinery added to
@@ -133,6 +137,17 @@ STATE_SCHEMA = 3
 
 #: Signals deferred across a hardware write.
 _DEFERRED = (signal.SIGINT, signal.SIGTERM)
+
+#: Signals the PROCESS was ignoring when a guard first took them over.
+#:
+#: Process-level, not per-guard, because that is what it describes. Held per
+#: guard, it was wrong in both directions: a guard arming after another had
+#: already installed could not see the application's real disposition and so
+#: never learned it, and a guard re-arming after another had installed over it
+#: read that other guard's handler as "an ordinary handler" and DISCARDED what
+#: it had correctly recorded. Either way a process that set SIG_IGN got killed.
+#: This is a lookup, never a call -- see GpuGuard._install_handlers.
+_IGNORED_AT_ARM: set = set()
 
 
 def _utcnow() -> str:
@@ -548,7 +563,15 @@ def _load_state(path: Path | str) -> tuple:
         return None, STATE_UNREADABLE, {"reason": "top level is not an object"}
 
     def _valid(rec):
-        return isinstance(rec, dict) and "pid" in rec
+        # `restored` is required, not optional. Every reader defaults a missing
+        # one to True (settled) -- which is the safe default for deciding
+        # whether to WRITE hardware, and the opposite of the safe default for
+        # deciding whether to OVERWRITE evidence. A record naming a clock lock
+        # but no `restored` key would be reported not-stale and armed straight
+        # over, destroying it. GuardState always serialises the field, so a
+        # record without it did not come from this module: treat it as
+        # uninterpretable rather than guessing which default it meant.
+        return isinstance(rec, dict) and "pid" in rec and "restored" in rec
 
     if "record" in doc:                                   # schema 3
         rec = doc["record"]
@@ -752,9 +775,6 @@ class GpuGuard:
         self._armed = False
         self._restored = True
         self._owner_thread: int | None = None
-        #: Signals the process was IGNORING when we armed. A lookup, never a
-        #: call -- see _install_handlers for why there is no handler chain.
-        self._ignored: set = set()
         #: One stable bound method. `self._signal_restore` builds a NEW bound
         #: object on every attribute access, so `signal.getsignal(sig) is
         #: self._signal_restore` is always False and cannot be used to ask "is
@@ -958,8 +978,16 @@ class GpuGuard:
         # blocking cannot strand a Ctrl+C behind a hanging driver.
         with _deferred_signals():
             self._install_handlers()
-            self._armed = True
+            # Publish BEFORE setting _armed. A raising _write_state (ENOSPC,
+            # EIO) would otherwise leave a guard that believes it holds the
+            # device with nothing on disk -- and because _armed short-circuits
+            # arm(), a retry would reach the hardware having never re-run
+            # _check_not_busy, overwriting whatever claim another process had
+            # published meanwhile. The in-memory flag must never claim more
+            # than the disk does. Safe to order it this way only because both
+            # statements are inside this block: nothing can observe the gap.
             _write_state(self._state_path, self.state)
+            self._armed = True
         return self
 
     def _install_handlers(self) -> None:
@@ -995,15 +1023,18 @@ class GpuGuard:
         for sig in _DEFERRED:
             try:
                 current = signal.getsignal(sig)
-                if current is not self._handler:
-                    # Refresh on every arm: an application may have changed the
-                    # disposition since the last one. Skip when ours is already
-                    # installed, or a re-arm would read our handler back and
-                    # forget that the signal was being ignored.
+                # Refresh on every arm -- an application may have changed the
+                # disposition since the last one -- but ONLY from a disposition
+                # that is not a guard's. Any guard's handler tells us nothing
+                # about what the application wanted, and reading one back is
+                # how the per-guard version lost the answer. "Not mine" is not
+                # enough here: it excludes only self-loops, which is the exact
+                # blind spot that took three passes to find in the old chain.
+                if not isinstance(getattr(current, "__self__", None), GpuGuard):
                     if current is signal.SIG_IGN:
-                        self._ignored.add(sig)
+                        _IGNORED_AT_ARM.add(sig)
                     else:
-                        self._ignored.discard(sig)
+                        _IGNORED_AT_ARM.discard(sig)
                 signal.signal(sig, self._handler)
             except (ValueError, OSError) as exc:  # pragma: no cover
                 self.handler_install_failures.append(str(sig))
@@ -1037,13 +1068,22 @@ class GpuGuard:
                 file=sys.stderr,
             )
 
-        if signum in self._ignored:
-            # The process deliberately ignored this signal before we armed.
-            # Restoring the GPU is ours to do; killing the process is not. Our
-            # handler stays installed, so if the restore just failed, a second
-            # delivery retries it -- the only case where a second delivery can
-            # happen at all, since every other path terminates below.
+        if signum in _IGNORED_AT_ARM:
+            # The process deliberately ignored this signal before any guard
+            # armed. Restoring the GPU is ours to do; killing the process is
+            # not. Our handler stays installed, so if the restore just failed a
+            # second delivery retries it -- the only case where a second
+            # delivery can happen at all, since every other path ends below.
             return
+
+        if signum == signal.SIGINT:
+            # SIGINT means KeyboardInterrupt in Python, and the narrowing must
+            # not quietly change that: `SIG_DFL` + `os.kill` would kill the
+            # process outright, so no `finally` runs, no `with` unwinds, and
+            # `main`'s NVML close is skipped. Raising reproduces the default
+            # disposition's OWN behaviour -- it is not a call back into
+            # whatever handler was there, which is the thing that was removed.
+            raise KeyboardInterrupt
 
         # Die the way the sender intended. Deliberately not "call whatever was
         # there before": see _install_handlers.
@@ -1064,20 +1104,22 @@ class GpuGuard:
 
     def lock_clocks(self, min_mhz: int, max_mhz: int | None = None) -> None:
         max_mhz = min_mhz if max_mhz is None else max_mhz
-        # Consent is checked BEFORE auto-arming. arm() now publishes a claim, so
-        # checking after it would leave a record on disk for a caller that was
-        # never allowed to touch the device -- and a kill in that window strands
-        # an operator-visible stale record produced by a guard with neither
-        # consent nor a write.
+        # Consent and the clock floor are both checked BEFORE auto-arming.
+        # arm() publishes a claim, so checking after it would leave a record on
+        # disk for a caller that was never allowed to touch the device -- and a
+        # kill in that window strands an operator-visible stale record produced
+        # by a guard with neither consent nor a write. A bad clock value is the
+        # caller's bug and is free to detect, so it costs nothing to refuse it
+        # before anything is published.
         self._check_consent()
+        self._check_clock_floor(min_mhz, max_mhz)
         if not self._armed:
             self.arm()
         self._check_owner_thread("lock clocks")
-        # Argument validation BEFORE the environment check: a bad clock value is
-        # the caller's bug and is free to detect, so report it even when
-        # unprivileged. Checking root first would send an operator to sudo and
-        # only then reveal the real problem.
-        self._check_clock_floor(min_mhz, max_mhz)
+        # Argument validation stays BEFORE the environment check (above): a bad
+        # clock value is the caller's bug, so report it even when unprivileged.
+        # Checking root first would send an operator to sudo and only then
+        # reveal the real problem.
         self._check_privilege()
 
         assert self.state is not None

@@ -53,12 +53,16 @@ def _isolate_signal_handlers():
     `test_the_stored_handler_is_one_stable_object` passed in the full suite and
     failed alone for exactly that reason.
     """
+    import joule_agent.gpu_guard as gg
     saved = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    ignored = set(gg._IGNORED_AT_ARM)
     try:
         yield
     finally:
         for sig, handler in saved.items():
             signal.signal(sig, handler)
+        gg._IGNORED_AT_ARM.clear()
+        gg._IGNORED_AT_ARM.update(ignored)
 
 
 def record(state_path, pid=None) -> dict:
@@ -2070,18 +2074,18 @@ def test_the_guard_never_calls_a_previous_handler(tmp_path):
     call. A guard that is armed OWNS these two signals; install yours around
     the guard, not under it.
     """
+    witness = tmp_path / "app-handler-ran"
     script = textwrap.dedent(f"""
         import os, signal, sys
         sys.path.insert(0, {str(Path.cwd())!r})
         from joule_agent.gpu_guard import FakeGpuController, GpuGuard
-        called = []
-        signal.signal(signal.SIGTERM, lambda s, f: called.append(s))
+        from pathlib import Path as _P
+        def app(signum, frame):
+            _P({str(tmp_path / "app-handler-ran")!r}).write_text("ran")
+        signal.signal(signal.SIGTERM, app)
         g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
                      state_path={str(tmp_path / "s.json")!r})
         g.arm(); g.lock_clocks(1400)
-        # Report before dying -- the guard re-raises with SIG_DFL.
-        import atexit
-        atexit.register(lambda: print("APP_CALLED", len(called), flush=True))
         os.kill(os.getpid(), signal.SIGTERM)
         print("SURVIVED", flush=True)
     """)
@@ -2089,8 +2093,11 @@ def test_the_guard_never_calls_a_previous_handler(tmp_path):
                        capture_output=True, text=True, timeout=60)
     assert "SURVIVED" not in p.stdout, "the guard did not let the process die"
     assert p.returncode == -signal.SIGTERM, f"rc={p.returncode} {p.stderr[-300:]!r}"
-    assert "APP_CALLED" not in p.stdout, (
-        "the application handler ran; the chain is back"
+    # The witness is written FROM THE HANDLER, synchronously. An earlier
+    # version reported via atexit -- which never runs after a SIG_DFL kill, so
+    # the assertion could not fail and passed under the very chain it excluded.
+    assert not witness.exists(), (
+        f"the application handler ran; the chain is back: {witness.read_text()!r}"
     )
 
 
@@ -2175,18 +2182,18 @@ def test_re_arming_refreshes_whether_the_signal_was_ignored(tmp_path,
     try:
         g = guard(tmp_path)
         g.arm()
-        assert signal.SIGTERM in g._ignored
+        assert signal.SIGTERM in gg._IGNORED_AT_ARM
         g.restore()
 
         # Re-arm while OUR handler is still installed: must not forget.
         g.arm()
-        assert signal.SIGTERM in g._ignored, "re-arm forgot the SIG_IGN"
+        assert signal.SIGTERM in gg._IGNORED_AT_ARM, "re-arm forgot the SIG_IGN"
         g.restore()
 
         # The application stops ignoring it; the next arm must notice.
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
         g.arm()
-        assert signal.SIGTERM not in g._ignored, "kept a stale SIG_IGN"
+        assert signal.SIGTERM not in gg._IGNORED_AT_ARM, "kept a stale SIG_IGN"
         g._signal_restore(signal.SIGTERM, None)
         assert killed == [signal.SIGTERM], "did not re-raise once un-ignored"
     finally:
@@ -2239,3 +2246,170 @@ def test_an_ignored_signal_during_arm_cannot_desync_armed_from_the_record(
         )
     finally:
         signal.signal(signal.SIGTERM, prev)
+
+
+def test_a_later_guard_inherits_the_processs_real_sig_ign(tmp_path, monkeypatch):
+    """The ignored disposition is a PROCESS fact, so it cannot live per guard.
+
+    The application sets SIG_IGN; guard A arms and records it; A restores
+    (nothing uninstalls, so A's handler stays installed); guard B arms and
+    reads A's handler back. Per-guard, B saw an "ordinary handler", never
+    learned the process was ignoring SIGTERM, and killed it.
+    """
+    import joule_agent.gpu_guard as gg
+    killed = []
+    monkeypatch.setattr(gg.os, "kill", lambda pid, sig: killed.append(sig))
+    prev = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        a = guard(tmp_path, controller=FakeGpuController())
+        a.arm()
+        a.restore()
+
+        b = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path=tmp_path / "b.json")
+        b.arm()
+        b.lock_clocks(1400)
+        b._signal_restore(signal.SIGTERM, None)
+
+        assert killed == [], "a later guard killed a process that ignores SIGTERM"
+        assert b._restored is True, "the restore did not run"
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+
+
+def test_a_guard_does_not_forget_sig_ign_when_another_installs_over_it(
+        tmp_path, monkeypatch):
+    """The same fact, the other direction.
+
+    A records SIG_IGN correctly; B installs over A; both disarm; A re-arms and
+    reads B's handler back. Per-guard, A treated that as "an ordinary handler"
+    and DISCARDED what it had correctly recorded.
+    """
+    import joule_agent.gpu_guard as gg
+    killed = []
+    monkeypatch.setattr(gg.os, "kill", lambda pid, sig: killed.append(sig))
+    prev = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        a = guard(tmp_path, controller=FakeGpuController())
+        b = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path=tmp_path / "b.json")
+        a.arm()
+        b.arm()
+        b.restore()
+        a.restore()
+
+        a.arm()                       # reads B's handler back
+        a.lock_clocks(1400)
+        a._signal_restore(signal.SIGTERM, None)
+
+        assert killed == [], "the guard forgot the SIG_IGN it had recorded"
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+
+
+def test_ctrl_c_still_raises_keyboard_interrupt(tmp_path):
+    """Removing the chain must not silently turn Ctrl+C into a hard kill.
+
+    SIG_DFL + os.kill would end the process outright: no `finally`, no `with`
+    unwind, no atexit, and main()'s NVML close skipped. Raising reproduces the
+    DEFAULT disposition's own behaviour -- which is not the same thing as
+    calling back into whatever handler was installed.
+    """
+    script = textwrap.dedent(f"""
+        import os, signal, sys
+        sys.path.insert(0, {str(Path.cwd())!r})
+        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
+        c = FakeGpuController()
+        g = GpuGuard(c, consent=True, require_root=False,
+                     state_path={str(tmp_path / "s.json")!r})
+        try:
+            with g:
+                g.lock_clocks(1400)
+                os.kill(os.getpid(), signal.SIGINT)
+                print("SURVIVED", flush=True)
+        except KeyboardInterrupt:
+            print("KBD", "LOCKED" if c.locked else "UNLOCKED", flush=True)
+        finally:
+            print("FINALLY_RAN", flush=True)
+    """)
+    p = subprocess.run([sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=60)
+    assert "SURVIVED" not in p.stdout, f"{p.stdout!r}"
+    assert "KBD UNLOCKED" in p.stdout, (
+        f"Ctrl+C did not raise KeyboardInterrupt with the GPU restored: "
+        f"{p.stdout!r} {p.stderr[-400:]!r}"
+    )
+    assert "FINALLY_RAN" in p.stdout, "the process was killed, so finally never ran"
+    assert record(tmp_path / "s.json")["restored"] is True
+
+
+def test_a_record_without_a_restored_key_is_not_read_as_settled(tmp_path):
+    """Missing means uninterpretable, not clean.
+
+    Every reader defaults a missing `restored` to True -- safe for deciding
+    whether to write hardware, and the exact opposite of safe for deciding
+    whether to overwrite evidence. A record naming a clock lock but no
+    `restored` key was reported not-stale and armed straight over.
+    """
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({"schema": 3, "record": {
+        "pid": 999_999, "device_index": 0, "device_uuid": "GPU-FAKE",
+        "clocks_locked": True, "locked_min_mhz": 900, "locked_max_mhz": 900,
+    }}))
+    rep = check_stale_state(FakeGpuController(), sp)
+    assert rep["state_file_unreadable"] is True
+    assert rep["stale"] is True
+
+    with pytest.raises(GuardBusyError):
+        guard(tmp_path, controller=FakeGpuController()).arm()
+    assert json.loads(sp.read_text())["record"]["clocks_locked"] is True, (
+        "armed over a record it could not interpret, destroying the evidence"
+    )
+
+
+def test_a_bad_clock_value_is_refused_before_any_claim_is_published(tmp_path):
+    """Same shape as the consent fix: refuse before arm() publishes."""
+    sp = tmp_path / "state.json"
+    g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                 state_path=sp)
+    with pytest.raises(ClockFloorError):
+        g.lock_clocks(100)
+    assert not sp.exists(), "a refused clock value still published a claim"
+    assert g._armed is False
+
+
+def test_a_failed_publish_during_arm_leaves_the_guard_disarmed(tmp_path):
+    """_armed must not claim more than the disk does.
+
+    arm() set _armed BEFORE writing the record. A transient write failure
+    (ENOSPC, EIO) then left a guard that believes it holds the device with
+    nothing published -- and because _armed short-circuits arm(), a retry
+    reaches the hardware having never re-run _check_not_busy, overwriting
+    whatever claim another process published in the meantime.
+    """
+    import joule_agent.gpu_guard as gg
+
+    sp = tmp_path / "state.json"
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+
+    real = gg._write_state
+    gg._write_state = lambda *a, **kw: (_ for _ in ()).throw(OSError("ENOSPC"))
+    try:
+        with pytest.raises(OSError):
+            g.arm()
+    finally:
+        gg._write_state = real
+
+    assert g._armed is False, "armed with nothing published"
+    assert not sp.exists()
+
+    # Another process takes the device while this one is retrying.
+    other = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path=sp)
+    other.arm()
+
+    # The retry must re-run _check_not_busy and be refused, not walk over it.
+    with pytest.raises(GuardBusyError):
+        g.lock_clocks(1400)
+    assert c.set_clock_calls == 0, "wrote hardware over another guard's claim"
