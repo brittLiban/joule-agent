@@ -42,6 +42,25 @@ from joule_agent.gpu_guard import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_signal_handlers():
+    """Restore SIGINT/SIGTERM around every test.
+
+    Signal dispositions are process-global and 25 tests here arm a guard
+    without restoring it, so without this the handler a test observes on entry
+    is often a dead guard's, left by whichever test ran before. That makes
+    order-dependent passes and order-dependent failures equally likely --
+    `test_the_stored_handler_is_one_stable_object` passed in the full suite and
+    failed alone for exactly that reason.
+    """
+    saved = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        yield
+    finally:
+        for sig, handler in saved.items():
+            signal.signal(sig, handler)
+
+
 def record(state_path, pid=None) -> dict:
     """Read the guard record. Schema 3 stores exactly one."""
     doc = json.loads(Path(state_path).read_text())
@@ -1557,8 +1576,13 @@ def test_installing_handlers_twice_does_not_chain_the_guard_to_itself(tmp_path):
         g._install_handlers()
         g._install_handlers()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            assert g._prev_handlers[sig] is not g._signal_restore, (
-                f"{sig!r}: the guard chained itself to its own handler"
+            # NOT `is not g._signal_restore` -- that builds a fresh bound method
+            # on every access, so the comparison is unconditionally true and
+            # passes under the very bug it claims to catch. Compare the
+            # underlying function.
+            rec = g._prev_handlers[sig]
+            assert getattr(rec, "__func__", None) is not GpuGuard._signal_restore, (
+                f"{sig!r}: the guard chained itself to a guard's own handler"
             )
         assert g._prev_handlers[signal.SIGINT] is original
     finally:
@@ -1959,3 +1983,148 @@ def test_a_moved_card_still_gets_the_plain_gpu_flag(tmp_path):
 
     res = restore_from_state_file(elsewhere, sp)
     assert "--gpu 1" in " ".join(res["errors"])
+
+
+# ---------------------------------------------------------------------------
+# Pass 10: findings from the pass-9 protected-surface review.
+# ---------------------------------------------------------------------------
+
+
+def test_two_guards_never_chain_into_a_cycle(tmp_path):
+    """"Not mine" excluded only self-loops, so two guards could record each other.
+
+    Nothing uninstalled on disarm, so a disarmed guard's handler stayed
+    installed and became the `current` the next guard recorded. After
+    a.arm / b.arm / a.restore / a.arm, _prev_handlers is a 2-cycle and
+    _signal_restore's chain call runs a -> b -> a -> ... unbounded: the process
+    survives a SIGTERM it was meant to die from, and if either restore is
+    failing, every level re-issues NVML resets and fsynced state writes.
+    """
+    original = signal.getsignal(signal.SIGINT)
+    a = guard(tmp_path, controller=FakeGpuController())
+    b = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                 state_path=tmp_path / "b.json")
+    try:
+        a.arm()
+        b.arm()
+        a.restore()
+        a.arm()
+
+        def chain(g, sig, seen=None):
+            seen = seen or []
+            prev = g._prev_handlers.get(sig)
+            owner = getattr(prev, "__self__", None)
+            assert owner not in seen, f"handler cycle: {seen + [owner]}"
+            if isinstance(owner, GpuGuard):
+                chain(owner, sig, seen + [owner])
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            chain(a, sig, [a])
+            chain(b, sig, [b])
+    finally:
+        for g in (a, b):
+            for sig, prev in list(g._prev_handlers.items()):
+                signal.signal(sig, prev)
+        signal.signal(signal.SIGINT, original)
+
+
+def test_a_disarmed_guard_puts_the_previous_handler_back(tmp_path):
+    """Disarming must leave the chain, not just stop using it.
+
+    Hermetic on purpose: 25 tests in this file arm a guard and never restore
+    it, so whatever SIGINT points at on entry is often a dead guard's handler
+    -- which _chain_link deliberately refuses to record. Install a known
+    non-guard handler so the assertion is about the guard, not about the
+    residue of the test that ran before it.
+    """
+    before = signal.getsignal(signal.SIGINT)
+    sentinel = lambda signum, frame: None
+    signal.signal(signal.SIGINT, sentinel)
+    try:
+        g = guard(tmp_path)
+        g.arm()
+        assert signal.getsignal(signal.SIGINT) is g._handler
+        g.restore()
+        assert signal.getsignal(signal.SIGINT) is sentinel, (
+            "a disarmed guard left its handler installed for the next to record"
+        )
+        assert g._prev_handlers == {}
+    finally:
+        signal.signal(signal.SIGINT, before)
+
+
+def test_a_disarming_guard_does_not_clobber_a_later_guards_handler(tmp_path):
+    """Only uninstall if OURS is the handler actually installed.
+
+    A guard that armed after us has installed over the top; restoring "our"
+    previous handler would delete its restore path.
+    """
+    before = signal.getsignal(signal.SIGINT)
+    a = guard(tmp_path, controller=FakeGpuController())
+    b = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                 state_path=tmp_path / "b.json")
+    try:
+        a.arm()
+        b.arm()
+        assert signal.getsignal(signal.SIGINT) is b._handler
+        a.restore()
+        assert signal.getsignal(signal.SIGINT) is b._handler, (
+            "a disarming guard deleted a live guard's restore path"
+        )
+        # And b did not chain to a: _chain_link takes a's link, not a itself.
+        assert getattr(b._prev_handlers[signal.SIGINT], "__self__", None) is not a
+    finally:
+        b.restore()
+        signal.signal(signal.SIGINT, before)
+
+
+def test_the_application_handler_still_runs_when_disarm_clears_the_chain(tmp_path):
+    """_signal_restore must read its chain link BEFORE restoring.
+
+    restore() disarms, and disarming clears _prev_handlers. Reading afterwards
+    finds None and kills the process by default action -- silently skipping the
+    application's own handler.
+    """
+    script = textwrap.dedent(f"""
+        import os, signal, sys
+        sys.path.insert(0, {str(Path.cwd())!r})
+        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
+        calls = []
+        signal.signal(signal.SIGTERM, lambda s, f: calls.append(s))
+        g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path={str(tmp_path / "s.json")!r})
+        with g:
+            g.lock_clocks(1400)
+            os.kill(os.getpid(), signal.SIGTERM)
+        print("APP_CALLS", len(calls))
+    """)
+    p = subprocess.run([sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=60)
+    assert "APP_CALLS 1" in p.stdout, (
+        f"the application's handler was skipped: {p.stdout!r} {p.stderr[-400:]!r}"
+    )
+
+
+def test_the_surrender_tail_is_not_re_enterable(tmp_path):
+    """A signal between the flag and the write disarmed under a frame that was
+    about to decide it should stay armed."""
+    import joule_agent.gpu_guard as gg
+
+    seen = {}
+    real = gg._write_state
+
+    def spy(*a, **kw):
+        seen["blocked"] = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        return real(*a, **kw)
+
+    sp = tmp_path / "state.json"
+    g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                 state_path=sp)
+    g.arm()
+    gg._write_state = spy
+    try:
+        g.restore()                       # arm-only: goes via _surrender_claim
+    finally:
+        gg._write_state = real
+    assert signal.SIGINT in seen["blocked"], "the surrender tail was interruptible"
+    assert signal.SIGTERM in seen["blocked"]

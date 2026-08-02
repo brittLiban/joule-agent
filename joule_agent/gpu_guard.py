@@ -26,7 +26,12 @@ Two constraints are enforced rather than defended against:
   earlier wholesale. Do not build on this as a guarantee. Closing it properly
   needs an inter-process lock, and the paragraph below is the reason there
   isn't one. To guard several devices at once, give each its own state file --
-  one file holds one record, and arming would overwrite another card's.
+  one file holds one record, and arming would overwrite another card's. Note
+  what that does NOT buy you: signal dispositions are process-global, so with
+  two guards armed only the last to install runs on SIGINT/SIGTERM. The earlier
+  one recovers through its state file, the documented hard-kill path, not
+  in-process. See :meth:`GpuGuard._chain_link` for why chaining between guards
+  was removed rather than repaired.
 
 This is a narrowing, and it was chosen on evidence. Four review passes of an
 earlier design found 27 defects; the large majority lived in machinery added to
@@ -945,20 +950,7 @@ class GpuGuard:
             try:
                 current = signal.getsignal(sig)
                 if current is not self._handler:
-                    # Record whatever is really there, unless it is already
-                    # ours. Recording unconditionally would, on a second
-                    # install, store our own handler as "what was here before",
-                    # after which the chain-to-previous call at the end of
-                    # _signal_restore would invoke itself until the stack blew
-                    # -- re-issuing NVML restores all the way down and leaving
-                    # the process alive on a SIGTERM it was meant to die from.
-                    #
-                    # Recording only ONCE is wrong too: the guard now disarms on
-                    # surrender, so an application can install its own handler
-                    # between one `with` block and the next. A once-only record
-                    # would overwrite that handler and chain to a stale one, and
-                    # the application's current handler would never run again.
-                    self._prev_handlers[sig] = current
+                    self._prev_handlers[sig] = self._chain_link(sig, current)
                 signal.signal(sig, self._handler)
             except (ValueError, OSError) as exc:  # pragma: no cover
                 self.handler_install_failures.append(str(sig))
@@ -981,7 +973,74 @@ class GpuGuard:
                 file=sys.stderr,
             )
 
+    @staticmethod
+    def _chain_link(sig, current):
+        """What to record as the previous handler for ``sig``.
+
+        **Never another guard.** Recording the handler that happens to be
+        installed sounds obviously right and is the source of three separate
+        defects:
+
+        * Recording it *unconditionally* meant a second install by the SAME
+          guard stored its own handler as "previous", and the chain call at the
+          end of :meth:`_signal_restore` invoked itself without bound -- NVML
+          resets and fsynced state writes all the way down, and the process
+          survived a SIGTERM it was meant to die from.
+        * Recording it *once only* fixed that but broke the opposite case: the
+          guard disarms on surrender, so an application can install its own
+          handler between two ``with`` blocks, and a once-only record
+          overwrote it and chained to a stale one.
+        * Recording it *unless it is mine* fixed that and reintroduced the
+          first, one object over: two guards that record each other are a
+          2-cycle, and "not mine" only ever excluded self-loops.
+
+        So take the guard's own link instead of the guard. That link is
+        inductively never a guard, so one lookup suffices -- no walk, no hop
+        limit, and a cycle cannot be represented rather than being detected.
+
+        **The trade, stated plainly.** With two guards armed in one process,
+        only the last to install runs on a signal; the earlier one no longer
+        restores in-process. Its state file still records ``restored: false``
+        with whatever it locked, so it recovers through the documented hard-kill
+        path, and ``_check_not_busy`` refuses the next arm until that runs. That
+        is a real degradation from chaining -- but it degrades to the crash path
+        this module is built around, instead of to an unbounded recursion that
+        leaves the process alive. Nothing in this repo arms two guards at once.
+        """
+        owner = getattr(current, "__self__", None)
+        if isinstance(owner, GpuGuard):
+            inherited = owner._prev_handlers.get(sig)
+            return signal.SIG_DFL if inherited is None else inherited
+        return current
+
+    def _uninstall_handlers(self) -> None:
+        """Leave the handler chain. Called wherever the guard disarms.
+
+        Leaving our handler installed after disarming is what makes the chain
+        cyclic: the NEXT guard to arm reads it back as its own "previous", and
+        once two guards have recorded each other, _signal_restore's chain call
+        invokes the other, which invokes back, unbounded -- the pass-7 failure
+        in a two-object shape. "Not mine" only ever excluded self-loops.
+
+        Restore the previous handler only if OURS is the one currently
+        installed. A guard that armed after us may have installed over the top,
+        and clobbering it would delete its restore path.
+        """
+        for sig, prev in list(self._prev_handlers.items()):
+            try:
+                if signal.getsignal(sig) is self._handler:
+                    signal.signal(sig, prev)
+            except (ValueError, OSError, TypeError):  # pragma: no cover
+                pass
+        self._prev_handlers.clear()
+
     def _signal_restore(self, signum, frame) -> None:
+        # Read the chain link BEFORE restoring: restore() disarms, and
+        # disarming clears _prev_handlers. Reading afterwards would find None
+        # and kill the process by default action, skipping the application's
+        # own handler entirely.
+        prev = self._prev_handlers.get(signum)
+
         # Hardware writes run with these signals blocked, so this handler can
         # never observe a half-applied write. No in-flight bookkeeping needed.
         try:
@@ -992,7 +1051,6 @@ class GpuGuard:
                 file=sys.stderr,
             )
 
-        prev = self._prev_handlers.get(signum)
         try:
             signal.signal(signum, prev if prev is not None else signal.SIG_DFL)
         except Exception:
@@ -1069,34 +1127,48 @@ class GpuGuard:
     # -- restore ---------------------------------------------------------
 
     def _surrender_claim(self) -> None:
-        """Release the published claim and disarm, so reuse re-checks the device.
+        """Release the published claim, disarm, and leave the handler chain.
 
-        Surrendering the claim without disarming would leave the guard object
-        able to write hardware while holding nothing on disk: ``_armed`` short-
-        circuits ``arm()``, so ``with g: pass`` followed by ``with g:
+        Surrendering without disarming would leave the guard object able to
+        write hardware while holding nothing on disk: ``_armed`` short-circuits
+        ``arm()``, so ``with g: pass`` followed by ``with g:
         g.lock_clocks(1400)`` would reach the device having never re-run
         ``_check_not_busy`` -- and in between, another process is free to arm
         over the released claim. Disarming forces the next use to re-snapshot
-        and re-check. Safe only because ``_install_handlers`` records the
-        previous handler once.
+        and re-check.
+
+        Disarming is safe only because it also **uninstalls**. A disarmed guard
+        that left its handler installed would be read back by the next guard to
+        arm as that guard's "previous", and two guards that have recorded each
+        other chain in a cycle. (An earlier version of this docstring said the
+        disarm was safe because handlers were recorded once; that stopped being
+        true, and the cycle is exactly what it stopped protecting against.)
+
+        The whole body runs with signals blocked. It is bookkeeping only -- no
+        NVML call is issued here, so blocking cannot strand a Ctrl+C behind a
+        hanging driver. Without it, a handler landing between the flag and the
+        write re-enters, disarms, and returns; the outer frame then rolls the
+        flag back intending to STAY armed, but the disarm already happened.
         """
-        if self.state is not None and not self.state.restored:
-            self.state.restored = True
-            self.state.restored_utc = _utcnow()
-            try:
-                _write_state(self._state_path, self.state)
-            except Exception:
-                # ROLL THE FLAG BACK. It gates this very block, so leaving it
-                # set means the retry on the next restore path silently skips
-                # the write -- the disk keeps saying the GPU is modified and
-                # nothing ever corrects it. The in-memory flag must never claim
-                # more than the disk does.
-                self.state.restored = False
-                self.state.restored_utc = None
-                # Do NOT disarm: the claim is still on disk, and a guard that
-                # re-arms over its own unreleased record would be refused.
-                return
-        self._armed = False
+        with _deferred_signals():
+            if self.state is not None and not self.state.restored:
+                self.state.restored = True
+                self.state.restored_utc = _utcnow()
+                try:
+                    _write_state(self._state_path, self.state)
+                except Exception:
+                    # ROLL THE FLAG BACK. It gates this very block, so leaving
+                    # it set means the retry on the next restore path silently
+                    # skips the write -- the disk keeps saying the GPU is
+                    # modified and nothing ever corrects it. The in-memory flag
+                    # must never claim more than the disk does.
+                    self.state.restored = False
+                    self.state.restored_utc = None
+                    # Do NOT disarm: the claim is still on disk, and a guard
+                    # that re-arms over its own unreleased record is refused.
+                    return
+            self._armed = False
+            self._uninstall_handlers()
 
     def restore(self) -> None:
         """Return the GPU to stock. Idempotent; safe to call any number of times.
@@ -1164,27 +1236,33 @@ class GpuGuard:
             )
 
         self._restored = True
-        if self.state is not None:
-            self.state.restore_failed = False
-            self.state.restore_errors = []
-            self.state.clocks_locked = False
-            self.state.restored = True
-            self.state.restored_utc = _utcnow()
-            try:
-                _write_state(self._state_path, self.state)
-            except Exception:
-                # Same rollback as _surrender_claim, and for the same reason:
-                # `restored` gates that method's write block, so leaving it set
-                # here kills the retry on every remaining path. The hardware is
-                # back to stock but the only evidence still says otherwise --
-                # do not also make it unfixable.
-                self.state.restored = False
-                self.state.restored_utc = None
-                # The claim is still on disk; stay armed.
-                return
-        # Disarm so a reused guard object re-snapshots and re-runs
-        # _check_not_busy. See _surrender_claim.
-        self._armed = False
+        # Bookkeeping tail, signal-blocked for the same reason as
+        # _surrender_claim's: a re-entrant restore here would disarm underneath
+        # a frame that is about to decide it should stay armed.
+        with _deferred_signals():
+            if self.state is not None:
+                self.state.restore_failed = False
+                self.state.restore_errors = []
+                self.state.clocks_locked = False
+                self.state.restored = True
+                self.state.restored_utc = _utcnow()
+                try:
+                    _write_state(self._state_path, self.state)
+                except Exception:
+                    # Same rollback as _surrender_claim, for the same reason:
+                    # `restored` gates that method's write block, so leaving it
+                    # set here kills the retry on every remaining path. The
+                    # hardware is back to stock but the only evidence still says
+                    # otherwise -- do not also make it unfixable.
+                    self.state.restored = False
+                    self.state.restored_utc = None
+                    # The claim is still on disk; stay armed.
+                    return
+            # Disarm so a reused guard object re-snapshots and re-runs
+            # _check_not_busy, and leave the handler chain. See
+            # _surrender_claim.
+            self._armed = False
+            self._uninstall_handlers()
 
     # -- context manager -------------------------------------------------
 
