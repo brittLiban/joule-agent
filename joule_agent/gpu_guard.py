@@ -701,6 +701,11 @@ class GpuGuard:
         self._restored = True
         self._owner_thread: int | None = None
         self._prev_handlers: dict = {}
+        #: One stable bound method. `self._signal_restore` builds a NEW bound
+        #: object on every attribute access, so `signal.getsignal(sig) is
+        #: self._signal_restore` is always False and cannot be used to ask "is
+        #: the handler already mine?".
+        self._handler = self._signal_restore
         self._atexit_registered = False
         self.handler_install_failures: list = []
 
@@ -778,11 +783,13 @@ class GpuGuard:
         rec_gpu = prior.get("device_index")
         gpu_flag = f" --gpu {rec_gpu}" if rec_gpu is not None else ""
         if pid == os.getpid():
-            # A guard cannot reach here about itself -- _armed is never reset,
-            # so arm() short-circuits after the first call. So this is either a
-            # SECOND GpuGuard object in this process, or this process's earlier
-            # guard whose restore FAILED. Both must be refused; they need
-            # different diagnoses.
+            # _armed IS reset now, on every successful surrender, so a guard
+            # CAN reach here about its own earlier record. Three ways in: a
+            # second GpuGuard object; this process's earlier guard whose restore
+            # failed; or one whose restore succeeded but whose final write did
+            # not land, leaving hardware stock and the record stale. All must be
+            # refused, and they need different diagnoses -- the third is the one
+            # where "give the second guard its own --state-path" is nonsense.
             if prior.get("restore_failed"):
                 raise GuardBusyError(
                     f"Refusing to arm: an earlier guard in this process (pid "
@@ -793,10 +800,14 @@ class GpuGuard:
                 )
             raise GuardBusyError(
                 f"Refusing to arm: another GpuGuard in this process (pid {pid}) "
-                f"holds an unrestored record in {self._state_path}. One guard "
-                "per device -- a second would capture the first's modified "
-                "settings as if they were stock, and restore to them. Give the "
-                "second guard its own --state-path if it is for another device."
+                f"holds an unrestored record in {self._state_path}. Either "
+                "another GpuGuard object is live -- one guard per device, since "
+                "a second would capture the first's modified settings as if "
+                "they were stock and restore to them; give it its own "
+                "--state-path if it is for another device -- or an earlier "
+                "guard in this process put the hardware back but could not "
+                "record it (a failed write to that path). Check whether the "
+                "path is writable; the record is stale in that case, not live."
             )
         if _pid_alive(pid):
             raise GuardBusyError(
@@ -896,17 +907,23 @@ class GpuGuard:
             self._atexit_registered = True
         for sig in _DEFERRED:
             try:
-                if sig not in self._prev_handlers:
-                    # Record the PREVIOUS handler exactly once. A second install
-                    # would read back self._signal_restore -- installed by the
-                    # first -- and store it as "what was here before", after
-                    # which _signal_restore's chain-to-previous call at the end
-                    # would call itself until the stack blew, re-issuing NVML
-                    # restores all the way down and leaving the process alive on
-                    # a SIGTERM it was supposed to die from. The application's
-                    # own handler would also be lost for good.
-                    self._prev_handlers[sig] = signal.getsignal(sig)
-                signal.signal(sig, self._signal_restore)
+                current = signal.getsignal(sig)
+                if current is not self._handler:
+                    # Record whatever is really there, unless it is already
+                    # ours. Recording unconditionally would, on a second
+                    # install, store our own handler as "what was here before",
+                    # after which the chain-to-previous call at the end of
+                    # _signal_restore would invoke itself until the stack blew
+                    # -- re-issuing NVML restores all the way down and leaving
+                    # the process alive on a SIGTERM it was meant to die from.
+                    #
+                    # Recording only ONCE is wrong too: the guard now disarms on
+                    # surrender, so an application can install its own handler
+                    # between one `with` block and the next. A once-only record
+                    # would overwrite that handler and chain to a stale one, and
+                    # the application's current handler would never run again.
+                    self._prev_handlers[sig] = current
+                signal.signal(sig, self._handler)
             except (ValueError, OSError) as exc:  # pragma: no cover
                 self.handler_install_failures.append(str(sig))
                 print(
@@ -1033,9 +1050,15 @@ class GpuGuard:
             try:
                 _write_state(self._state_path, self.state)
             except Exception:
-                # Do NOT disarm: the claim may still be on disk, and a guard
-                # that re-arms over its own unreleased record would be refused
-                # anyway. Staying armed keeps the remaining restore paths live.
+                # ROLL THE FLAG BACK. It gates this very block, so leaving it
+                # set means the retry on the next restore path silently skips
+                # the write -- the disk keeps saying the GPU is modified and
+                # nothing ever corrects it. The in-memory flag must never claim
+                # more than the disk does.
+                self.state.restored = False
+                self.state.restored_utc = None
+                # Do NOT disarm: the claim is still on disk, and a guard that
+                # re-arms over its own unreleased record would be refused.
                 return
         self._armed = False
 
@@ -1106,16 +1129,22 @@ class GpuGuard:
 
         self._restored = True
         if self.state is not None:
-            self.state.restored = True
             self.state.restore_failed = False
             self.state.restore_errors = []
             self.state.clocks_locked = False
+            self.state.restored = True
             self.state.restored_utc = _utcnow()
             try:
                 _write_state(self._state_path, self.state)
             except Exception:
-                # The claim may still be on disk; stay armed. See
-                # _surrender_claim for why disarming here would be wrong.
+                # Same rollback as _surrender_claim, and for the same reason:
+                # `restored` gates that method's write block, so leaving it set
+                # here kills the retry on every remaining path. The hardware is
+                # back to stock but the only evidence still says otherwise --
+                # do not also make it unfixable.
+                self.state.restored = False
+                self.state.restored_utc = None
+                # The claim is still on disk; stay armed.
                 return
         # Disarm so a reused guard object re-snapshots and re-runs
         # _check_not_busy. See _surrender_claim.

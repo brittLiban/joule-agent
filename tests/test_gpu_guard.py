@@ -1761,3 +1761,140 @@ def test_reads_still_need_no_consent_after_that_change(tmp_path):
     assert g.snapshot.name == "FakeGPU"
     assert c.set_clock_calls == 0
     assert check_stale_state(FakeGpuController(), tmp_path / "s.json") is not None
+
+
+# ---------------------------------------------------------------------------
+# Pass 9: findings from the pass-8 protected-surface review.
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_final_write_leaves_the_retry_alive(tmp_path):
+    """The in-memory flag must never claim more than the disk does.
+
+    restore() flipped state.restored to True and THEN wrote. If the write
+    failed it returned quietly -- and because that same flag gates
+    _surrender_claim's write block, every later restore path skipped the retry.
+    Hardware back to stock, disk still saying it is modified, and nothing on
+    any path ever correcting it.
+    """
+    import joule_agent.gpu_guard as gg
+
+    sp = tmp_path / "state.json"
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+    g.arm()
+    g.lock_clocks(1400)
+
+    real = gg._write_state
+    gg._write_state = lambda *a, **kw: (_ for _ in ()).throw(OSError("ENOSPC"))
+    try:
+        g.restore()                       # hardware restored; record write fails
+    finally:
+        gg._write_state = real
+
+    assert c.locked is None, "precondition: the hardware really was restored"
+    assert record(sp)["restored"] is False, "precondition: the disk is stale"
+    assert g.state.restored is False, (
+        "the in-memory flag outran the disk, which kills every retry"
+    )
+    assert g._armed is True, "disarmed while the claim was still published"
+
+    g.restore()                           # the retry must now actually write
+    assert record(sp)["restored"] is True, "no restore path ever retried"
+    assert g._armed is False
+
+
+def test_a_handler_installed_between_uses_is_not_lost(tmp_path):
+    """Recording the previous handler ONCE is wrong now that the guard disarms.
+
+    An application can install its own handler between one `with` block and the
+    next. A once-only record overwrites it with _signal_restore and chains to
+    the stale handler from the first arm, so the application's current handler
+    never runs again -- and is unrecoverable.
+    """
+    script = textwrap.dedent(f"""
+        import os, signal, sys
+        sys.path.insert(0, {str(Path.cwd())!r})
+        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
+
+        first, second = [], []
+        signal.signal(signal.SIGTERM, lambda s, f: first.append(s))
+
+        g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path={str(tmp_path / "s.json")!r})
+        with g:
+            pass                          # arms, surrenders, disarms
+
+        # The application changes its mind between uses.
+        signal.signal(signal.SIGTERM, lambda s, f: second.append(s))
+
+        with g:
+            g.lock_clocks(1400)
+            os.kill(os.getpid(), signal.SIGTERM)
+        print("FIRST", len(first), "SECOND", len(second))
+    """)
+    p = subprocess.run([sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=60)
+    assert "FIRST 0 SECOND 1" in p.stdout, (
+        f"the handler installed between uses was lost: "
+        f"{p.stdout!r} {p.stderr[-400:]!r}"
+    )
+
+
+def test_the_stored_handler_is_one_stable_object(tmp_path):
+    """The mechanism the fix depends on, pinned directly.
+
+    `self._signal_restore` builds a new bound method on every access, so an
+    `is` comparison against it is always False -- which would make the "is the
+    handler already mine?" question unanswerable and silently reinstate the
+    once-only bug.
+    """
+    g = guard(tmp_path)
+    assert g._signal_restore is not g._signal_restore, (
+        "bound methods stopped being per-access; the guard below is moot"
+    )
+    assert g._handler is g._handler
+    original = signal.getsignal(signal.SIGINT)
+    try:
+        g._install_handlers()
+        assert signal.getsignal(signal.SIGINT) is g._handler
+    finally:
+        for sig, prev in g._prev_handlers.items():
+            signal.signal(sig, prev)
+    assert original is signal.getsignal(signal.SIGINT)
+
+
+def test_a_failed_claim_release_also_leaves_the_retry_alive(tmp_path):
+    """The same rollback, on the arm-only path.
+
+    A guard that never wrote hardware still has a claim to release, and
+    _surrender_claim's own write can fail. Its flag gates its own write block,
+    so leaving it set makes every later call a no-op over a claim that is still
+    published -- which then refuses the next arm forever.
+    """
+    import joule_agent.gpu_guard as gg
+
+    sp = tmp_path / "state.json"
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+    g.arm()                                     # claim published, nothing written
+    assert record(sp)["restored"] is False
+
+    real = gg._write_state
+    gg._write_state = lambda *a, **kw: (_ for _ in ()).throw(OSError("EIO"))
+    try:
+        g.restore()                             # goes straight to _surrender_claim
+    finally:
+        gg._write_state = real
+
+    assert c.reset_calls == 0, "an arm-only guard touched hardware"
+    assert record(sp)["restored"] is False, "precondition: the claim is still up"
+    assert g.state.restored is False, (
+        "the flag outran the disk, so _surrender_claim's own retry is dead"
+    )
+    assert g._armed is True
+
+    g.restore()
+    assert record(sp)["restored"] is True, "the claim was never released"
+    assert g._armed is False
+    assert c.reset_calls == 0
