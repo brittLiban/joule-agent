@@ -194,8 +194,19 @@ def _deferred_signals():
     if not hasattr(signal, "pthread_sigmask"):  # pragma: no cover - non-POSIX
         yield
         return
-    previous = signal.pthread_sigmask(signal.SIG_BLOCK, set(_DEFERRED))
+    # Read the current mask with a NON-MUTATING call first, then block inside
+    # the try. Blocking on the same line that captures `previous` is unsafe now
+    # that _signal_restore can raise: a signal whose C-level flag is already set
+    # can have its Python handler dispatched at the eval-breaker check right
+    # after the call returns -- after the mask is applied, before any `try:`
+    # below it is entered -- and that unwind skips the restore, leaving SIGINT
+    # and SIGTERM blocked for the life of the process. No further Ctrl+C, no
+    # SIGTERM, and no in-process restore path on either. Splitting the read
+    # from the block means `previous` is always valid by the time anything can
+    # raise, so the finally is always able to put the mask back.
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, [])
     try:
+        signal.pthread_sigmask(signal.SIG_BLOCK, set(_DEFERRED))
         yield
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous)
@@ -773,6 +784,11 @@ class GpuGuard:
 
         self._depth = 0
         self._armed = False
+        #: True only while THIS arm cycle's record is on disk. Without it,
+        #: _surrender_claim writes whenever the in-memory flag says unrestored
+        #: -- including before arm() has published anything, when the file
+        #: still belongs to whoever wrote it last. See _surrender_claim.
+        self._published = False
         self._restored = True
         self._owner_thread: int | None = None
         #: One stable bound method. `self._signal_restore` builds a NEW bound
@@ -952,6 +968,15 @@ class GpuGuard:
             )
         self._check_not_busy()
 
+        # Cleared HERE, before self.state is rebuilt -- not just before the
+        # publish. The stretch from here to the signal-blocked section below is
+        # interruptible (threading.get_ident() is a delivery point), and a
+        # handler landing in it runs _surrender_claim against the PREVIOUS
+        # cycle's _published. That would write `restored: true` and disarm, and
+        # then the resuming frame would publish that same clean record while
+        # setting _armed True: a guard holding the device over a record saying
+        # nobody does.
+        self._published = False
         claim = getattr(self._c, "claim", None)
         if callable(claim):
             claim(self)
@@ -987,6 +1012,7 @@ class GpuGuard:
             # than the disk does. Safe to order it this way only because both
             # statements are inside this block: nothing can observe the gap.
             _write_state(self._state_path, self.state)
+            self._published = True
             self._armed = True
         return self
 
@@ -1101,6 +1127,7 @@ class GpuGuard:
         self.state.restored = False
         self._restored = False
         _write_state(self._state_path, self.state)
+        self._published = True
 
     def lock_clocks(self, min_mhz: int, max_mhz: int | None = None) -> None:
         max_mhz = min_mhz if max_mhz is None else max_mhz
@@ -1174,6 +1201,9 @@ class GpuGuard:
         disarm was safe because handlers were recorded once; that stopped being
         true, and the cycle is exactly what it stopped protecting against.)
 
+        It writes only what this arm cycle published (``_published``); see the
+        branch below for the two ways a guard can reach here owning nothing.
+
         The whole body runs with signals blocked. It is bookkeeping only -- no
         NVML call is issued here, so blocking cannot strand a Ctrl+C behind a
         hanging driver. Without it, a handler landing between the flag and the
@@ -1181,6 +1211,21 @@ class GpuGuard:
         flag back intending to STAY armed, but the disarm already happened.
         """
         with _deferred_signals():
+            if not self._published:
+                # Nothing of OURS is on disk. Two ways here, and both are made
+                # safe by leaving the file alone:
+                #
+                #  * arm()'s publish raised, so the file still belongs to
+                #    whoever wrote it last -- possibly another process's live
+                #    claim. Writing our clean record over it would tell
+                #    recovery that device is free while its clock lock stands.
+                #  * a signal landed between building self.state and the
+                #    publish. Mutating restored here would make the resuming
+                #    arm() publish "the device is free" while setting _armed
+                #    True -- a guard that holds the device over a record
+                #    saying nobody does.
+                self._armed = False
+                return
             if self.state is not None and not self.state.restored:
                 self.state.restored = True
                 self.state.restored_utc = _utcnow()

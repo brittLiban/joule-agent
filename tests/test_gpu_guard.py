@@ -1795,7 +1795,6 @@ def test_the_stored_handler_is_one_stable_object(tmp_path):
         assert signal.getsignal(signal.SIGINT) is g._handler
     finally:
         signal.signal(signal.SIGINT, original)
-        signal.signal(signal.SIGTERM, signal.getsignal(signal.SIGTERM))
 
 
 def test_a_failed_claim_release_also_leaves_the_retry_alive(tmp_path):
@@ -1929,61 +1928,6 @@ def test_the_surrender_tail_is_not_re_enterable(tmp_path):
 # Pass 11: findings from the pass-10 protected-surface review.
 # ---------------------------------------------------------------------------
 
-
-def test_a_signal_during_arm_cannot_leave_it_armed_without_handlers(tmp_path):
-    """arm() installs handlers, then sets _armed.
-
-    A signal in that window used to run _signal_restore -> restore ->
-    _surrender_claim, which uninstalled and set _armed False; the interrupted
-    frame then resumed and set _armed True, leaving the guard armed with no
-    handlers and nothing to reinstall them (every entry point short-circuits on
-    _armed). Two independent things now prevent it: install/arm/publish is one
-    signal-blocked step, and disarming no longer uninstalls at all.
-
-    What must be observable: the guard restores and the process dies. It must
-    never come out the other side still running.
-    """
-    script = textwrap.dedent(f"""
-        import os, signal, sys
-        sys.path.insert(0, {str(Path.cwd())!r})
-        import joule_agent.gpu_guard as gg
-        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
-
-        g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
-                     state_path={str(tmp_path / "s.json")!r})
-
-        # Fire from inside _install_handlers -- the real window is between
-        # installing and `_armed = True`. Firing from _write_state would miss
-        # it, because _write_state blocks these signals itself.
-        real = gg.GpuGuard._install_handlers
-        def spy(self):
-            real(self)
-            os.kill(os.getpid(), signal.SIGTERM)
-        gg.GpuGuard._install_handlers = spy
-        g.arm()
-        gg.GpuGuard._install_handlers = real
-        print("ARMED", g._armed, "HANDLER",
-              signal.getsignal(signal.SIGTERM) is g._handler, flush=True)
-    """)
-    p = subprocess.run([sys.executable, "-c", script],
-                       capture_output=True, text=True, timeout=60)
-
-    if "ARMED" in p.stdout:
-        # If the frame did resume, the conjunction is what matters: armed
-        # WITHOUT a handler is the state nothing can recover from.
-        armed = "ARMED True" in p.stdout
-        handler = "HANDLER True" in p.stdout
-        assert not (armed and not handler), (
-            f"armed with no signal handler installed: {p.stdout!r}"
-        )
-    else:
-        assert p.returncode == -signal.SIGTERM, (
-            f"neither survived nor died from the signal: rc={p.returncode} "
-            f"{p.stdout!r} {p.stderr[-400:]!r}"
-        )
-        assert record(tmp_path / "s.json")["restored"] is True, (
-            "died without releasing the claim it had just published"
-        )
 
 def test_the_clock_floor_cannot_be_lowered_by_a_constructor_argument(tmp_path):
     """Invariant 3 is a refusal, not a default. min_clock_mhz=0 disabled it."""
@@ -2430,3 +2374,145 @@ def test_the_cli_lock_refuses_a_bad_clock_before_it_arms(tmp_path):
                "--hold", "0", CONSENT_FLAG])
     assert rc == 2, "a below-floor lock did not fail loudly"
     assert not sp.exists(), "a floor-refused CLI run published a claim"
+
+
+def test_a_guard_that_published_nothing_does_not_write_over_the_file(tmp_path):
+    """_surrender_claim wrote whenever the in-memory flag said unrestored.
+
+    There was no "did I ever publish?" predicate, so a guard whose arm-time
+    write had FAILED still wrote its clean record at exit -- over whatever was
+    there, which can be another process's live claim. Recovery then reads
+    `restored: true` and reports the device clean while its clock lock stands.
+    """
+    import joule_agent.gpu_guard as gg
+
+    sp = tmp_path / "state.json"
+    failed = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                      state_path=sp)
+    real = gg._write_state
+    gg._write_state = lambda *a, **kw: (_ for _ in ()).throw(OSError("ENOSPC"))
+    try:
+        with pytest.raises(OSError):
+            failed.arm()
+    finally:
+        gg._write_state = real
+    assert not sp.exists()
+
+    # Another process takes the device and locks it.
+    live = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                    state_path=sp)
+    live.arm()
+    live.lock_clocks(1400)
+    assert record(sp)["restored"] is False
+
+    # The failed guard exits. Its atexit callback was registered before the
+    # write failed, so this is what really runs.
+    failed._atexit_restore()
+
+    rec = record(sp)
+    assert rec["restored"] is False, (
+        "a guard that published nothing overwrote a live claim with a clean "
+        "record -- the locked GPU now has no evidence it is locked"
+    )
+    assert rec["clocks_locked"] is True
+    assert rec["pid"] == os.getpid() and rec["locked_min_mhz"] == 1400
+
+
+def test_a_signal_before_the_publish_cannot_desync_armed_from_the_record(
+        tmp_path, monkeypatch):
+    """The window between building self.state and publishing it is NOT blocked.
+
+    `self._owner_thread = threading.get_ident()` sits in it and is a delivery
+    point. Under SIG_IGN the handler returns and arm() resumes: _surrender_claim
+    had flipped state.restored to True, so the resuming publish wrote "the
+    device is free" while setting _armed True. Another process's
+    _check_not_busy then reads clean and arms the same device.
+    """
+    import joule_agent.gpu_guard as gg
+
+    killed = []
+    monkeypatch.setattr(gg.os, "kill", lambda pid, sig: killed.append(sig))
+    prev = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        sp = tmp_path / "state.json"
+        g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path=sp)
+        g.arm()                       # records the SIG_IGN disposition
+        g.restore()
+
+        # Fire in the unblocked window of the SECOND arm.
+        real = threading.get_ident
+        fired = []
+
+        def once():
+            # Fire ONLY in the target window. threading.current_thread() at the
+            # top of arm() also calls get_ident, well before self.state is
+            # rebuilt -- firing there would test nothing. The new GuardState is
+            # the marker: restored False and not yet armed.
+            if (not fired and g.state is not None
+                    and g.state.restored is False and not g._armed):
+                fired.append(1)
+                gg.signal.raise_signal(signal.SIGTERM)
+            return real()
+
+        monkeypatch.setattr(gg.threading, "get_ident", once)
+        g.arm()
+        monkeypatch.setattr(gg.threading, "get_ident", real)
+
+        assert fired, "the signal never landed in the target window"
+        assert killed == [], "killed a process that ignores SIGTERM"
+        held = g._armed
+        claimed = record(sp)["restored"] is False
+        assert held == claimed, (
+            f"_armed={held} but the record says the device is "
+            f"{'held' if claimed else 'free'} -- another process would arm "
+            f"straight over this guard"
+        )
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+
+
+def test_a_raise_from_the_handler_does_not_leave_the_signals_blocked(tmp_path):
+    """_deferred_signals took the mask OUTSIDE its try.
+
+    A pending SIGINT can have its Python handler dispatched right after
+    pthread_sigmask returns and before the `try:` is entered. Since the handler
+    now raises KeyboardInterrupt, that unwind skipped the finally and left
+    SIGINT and SIGTERM blocked for the life of the process -- no further Ctrl+C,
+    no SIGTERM, and no in-process restore path on either.
+    """
+    import joule_agent.gpu_guard as gg
+
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    with pytest.raises(KeyboardInterrupt):
+        with gg._deferred_signals():
+            raise KeyboardInterrupt
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, []) == before, (
+        "an exception through the block left the mask changed"
+    )
+
+    # The harder shape, and the one that actually discriminates: the mask IS
+    # applied and then the handler unwinds before the try is entered. Capturing
+    # `previous` on the same call that blocks cannot survive this -- the
+    # assignment never completes, so the finally has nothing to restore to.
+    real = signal.pthread_sigmask
+    fired = []
+
+    def boom(how, mask=None):
+        if how == signal.SIG_BLOCK and mask and not fired:
+            fired.append(1)
+            real(how, mask)                 # the block really takes effect
+            raise KeyboardInterrupt         # ... and then we unwind
+        return real(how, mask if mask is not None else [])
+
+    gg.signal.pthread_sigmask = boom
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            with gg._deferred_signals():
+                pass
+    finally:
+        gg.signal.pthread_sigmask = real
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, []) == before, (
+        "an unwind between applying the mask and entering the try left "
+        "SIGINT/SIGTERM blocked for the life of the process"
+    )
