@@ -6,41 +6,55 @@ stock clock and power settings.**
 
 Nothing else may call ``nvmlDeviceSetGpuLockedClocks``,
 ``nvmlDeviceSetPowerManagementLimit``, ``nvidia-smi -lgc`` or ``nvidia-smi -pl``.
-The sweep runner and the dynamic controller go through here. That is not a style
-preference: a safety net that lives inside the code it protects is not a net,
-because the first buggy draft of that code runs on real hardware with nothing
-underneath it.
+A safety net that lives inside the code it protects is not a net, because the
+first buggy draft of that code runs on real hardware with nothing underneath it.
+
+Deliberately single-thread, single-instance
+-------------------------------------------
+Two constraints are enforced rather than defended against:
+
+* **One thread.** The guard must be armed on the main thread, and only that
+  thread may write. A worker thread calling :meth:`GpuGuard.lock_clocks` is
+  refused.
+* **One instance per machine.** Arming is refused while any unrestored record
+  exists in the state file -- whether the process that wrote it is alive
+  (another guard is running) or dead (a previous run needs recovery first).
+
+This is a narrowing, and it was chosen on evidence. Four review passes of an
+earlier design found 27 defects; the large majority lived in machinery added to
+make concurrent use safe -- an unlocked signal-path restore, write-depth and
+generation counters, per-pid state merging, an inter-process ``flock``. That
+apparatus generated defects faster than it retired hazards, and one of its own
+fixes introduced a hang on the Ctrl+C path, which is the exact failure this
+module exists to prevent. None of it was reachable by any real caller. A future
+dynamic controller owns its guard on one thread.
+
+The residual same-thread hazard is closed by construction, not by detection:
+SIGINT and SIGTERM are **blocked for the duration of each hardware write** (see
+:func:`_deferred_signals`). A signal arriving mid-write stays pending and is
+delivered the instant the write completes, so a handler can never observe or act
+on a half-applied write. That removes the need for in-flight bookkeeping.
 
 What can and cannot be verified
 -------------------------------
 This driver exposes no ``nvmlDeviceGetGpuLockedClocks``. There is no way to ask
-the device whether a clock lock is currently applied. Two consequences, both
-deliberate:
+the device whether a clock lock is applied. Two consequences:
 
 * **Restore is unconditional.** :meth:`GpuGuard.restore` always issues
-  ``nvmlDeviceResetGpuLockedClocks`` rather than checking first and skipping.
-  Resetting an unlocked GPU is a no-op, so this is idempotent for free, and it
-  removes any dependence on a readback that does not exist.
-* **Stale-state detection has two tiers of confidence**, and
-  :func:`check_stale_state` labels which is which:
-
-  ``power limit``
-      Verifiable. ``GetPowerManagementLimit() != GetPowerManagementDefaultLimit()``
-      is direct evidence from the device that a previous run left a cap behind.
-  ``clock lock``
-      Not verifiable. Detection relies entirely on the state file. A file with
-      ``restored: false`` means a process died holding a lock. The device itself
-      cannot confirm or deny it.
-
-Clock-lock state in the state file is therefore *asserted by us*, never
-*observed from the device*.
+  ``nvmlDeviceResetGpuLockedClocks`` rather than checking first. Resetting an
+  unlocked GPU is a no-op, so this is idempotent for free and depends on no
+  readback.
+* **Stale detection has two tiers**, and :func:`check_stale_state` labels which
+  is which. The power limit is *verifiable from the device*; a clock lock is
+  *asserted by the state file only*.
 
 Crash ordering
 --------------
 The state file is written and fsynced **before** the first hardware write, with
-``restored: false``. The window this closes is a crash between locking the clock
-and recording that we did -- precisely the case the file exists for. The flag
-flips to ``restored: true`` only after the reset returns.
+``restored: false``. That closes the window between locking a clock and
+recording that we did. The flag flips to ``restored: true`` only after a restore
+completes without error -- a failed restore leaves it false, because with no
+readback the file is the only evidence that exists.
 
 Privilege
 ---------
@@ -59,6 +73,7 @@ import signal
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +86,8 @@ __all__ = [
     "ConsentError",
     "PrivilegeError",
     "ClockFloorError",
+    "ThreadAffinityError",
+    "GuardBusyError",
     "DeviceSnapshot",
     "GuardState",
     "GpuController",
@@ -85,8 +102,7 @@ __all__ = [
 
 #: Hard floor. A lock below this is REFUSED, never silently clamped -- a caller
 #: that asked for 100 MHz has a bug or a bad config, and quietly giving them
-#: something else hides it. Deliberately conservative; raise it per-device only
-#: with measurements showing the device is stable lower.
+#: something else hides it.
 MIN_SM_CLOCK_MHZ = 300
 
 #: Required before the first hardware write in a process.
@@ -97,6 +113,11 @@ CONSENT_FLAG = "--i-understand-this-changes-gpu-settings"
 DEFAULT_STATE_PATH = Path(
     os.environ.get("JOULE_GUARD_STATE", "results/gpu_guard_state.json")
 )
+
+STATE_SCHEMA = 3
+
+#: Signals deferred across a hardware write.
+_DEFERRED = (signal.SIGINT, signal.SIGTERM)
 
 
 def _utcnow() -> str:
@@ -117,6 +138,37 @@ class PrivilegeError(GpuGuardError):
 
 class ClockFloorError(GpuGuardError):
     pass
+
+
+class ThreadAffinityError(GpuGuardError):
+    """Armed or written from a thread that is not allowed to."""
+
+
+class GuardBusyError(GpuGuardError):
+    """Another guard holds the device, or a previous run never restored."""
+
+
+@contextmanager
+def _deferred_signals():
+    """Block SIGINT/SIGTERM for the duration of a hardware write.
+
+    A signal handler running between "record intent" and "issue the write"
+    could reset the device and mark everything clean, after which the
+    interrupted frame applies the setting -- GPU modified, state clean. Rather
+    than detect that interleaving with in-flight bookkeeping, make it
+    impossible: the signal stays pending and is delivered the moment the write
+    completes, so the handler always sees a settled state.
+
+    No-op where pthread_sigmask is unavailable.
+    """
+    if not hasattr(signal, "pthread_sigmask"):  # pragma: no cover - non-POSIX
+        yield
+        return
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, set(_DEFERRED))
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
 
 
 # ---------------------------------------------------------------------------
@@ -157,29 +209,33 @@ class GpuController(Protocol):
     def close(self) -> None: ...
 
 
-class NvmlGpuController:
-    """Real NVML. The only place in the codebase that writes GPU state."""
+def _same_owner(current, owner) -> bool:
+    """True if `owner` may claim a controller `current` already holds.
 
-    def __init__(self, index: int = 0) -> None:
-        import pynvml
+    Identity first (guards are objects), then equality, because the recovery
+    path claims with a string literal and `is` on strings only works via
+    CPython interning.
+    """
+    if current is None or current is owner:
+        return True
+    try:
+        return bool(current == owner)
+    except Exception:
+        return False
 
-        self._n = pynvml.nvmlInit() or pynvml
-        self._nvml = pynvml
-        self._h = pynvml.nvmlDeviceGetHandleByIndex(index)
-        self._index = index
-        self._closed = False
-        self._claimed_by = None
+
+class _ClaimMixin:
+    """Refuses hardware writes from a controller no guard is holding.
+
+    A guard-rail against the common mistake of constructing a controller and
+    calling it directly, which would bypass the clock floor, the consent flag
+    and the privilege check. ``claim`` is public and Python offers no way to
+    make it otherwise, so this is not a security boundary.
+    """
+
+    _claimed_by = None
 
     def claim(self, owner) -> None:
-        """Mark this controller as owned by a guard (or the recovery path).
-
-        Exclusive: a second claim by a different owner is refused, so two
-        guards cannot silently share one controller. This is a guard-rail
-        against accident, NOT a security boundary -- `claim()` is public and
-        Python has no way to make it otherwise. It exists so that the common
-        mistake (constructing a controller and calling it directly) fails
-        loudly instead of bypassing the floor, consent and privilege checks.
-        """
         if not _same_owner(self._claimed_by, owner):
             raise GpuGuardError(
                 f"controller already claimed by {self._claimed_by!r}; refusing "
@@ -191,10 +247,23 @@ class NvmlGpuController:
         if self._claimed_by is None:
             raise GpuGuardError(
                 "Refusing a direct hardware write: this controller is not held "
-                "by a GpuGuard. Constructing NvmlGpuController does not grant "
-                "write access -- it would bypass the clock floor, the consent "
-                "flag and the privilege check. Use `with gpu_guard(...)`."
+                "by a GpuGuard. Constructing a controller does not grant write "
+                "access. Use `with gpu_guard(...)`."
             )
+
+
+class NvmlGpuController(_ClaimMixin):
+    """Real NVML. The only place in the codebase that writes GPU state."""
+
+    def __init__(self, index: int = 0) -> None:
+        import pynvml
+
+        pynvml.nvmlInit()
+        self._nvml = pynvml
+        self._h = pynvml.nvmlDeviceGetHandleByIndex(index)
+        self._index = index
+        self._closed = False
+        self._claimed_by = None
 
     def _try(self, fn, default=None):
         try:
@@ -229,14 +298,18 @@ class NvmlGpuController:
         )
 
     def set_locked_clocks(self, min_mhz: int, max_mhz: int) -> None:
-        self._write(lambda: self._nvml.nvmlDeviceSetGpuLockedClocks(self._h, min_mhz, max_mhz))
+        self._write(
+            lambda: self._nvml.nvmlDeviceSetGpuLockedClocks(self._h, min_mhz, max_mhz)
+        )
 
     def reset_locked_clocks(self) -> None:
         self._write(lambda: self._nvml.nvmlDeviceResetGpuLockedClocks(self._h))
 
     def set_power_limit_mw(self, milliwatts: int) -> None:
         self._write(
-            lambda: self._nvml.nvmlDeviceSetPowerManagementLimit(self._h, int(milliwatts))
+            lambda: self._nvml.nvmlDeviceSetPowerManagementLimit(
+                self._h, int(milliwatts)
+            )
         )
 
     def get_power_limit_mw(self) -> int | None:
@@ -250,7 +323,7 @@ class NvmlGpuController:
     def _write(self, fn) -> None:
         self._require_claim()
         if self._closed:
-            # An atexit retry can fire after close(); a swallowed
+            # An exit-time retry can fire after close(); a swallowed
             # NVMLError_Uninitialized here would look like a successful restore.
             raise GpuGuardError(
                 "controller is closed; NVML was shut down before this write. "
@@ -262,9 +335,9 @@ class NvmlGpuController:
         except Exception as exc:
             if type(exc).__name__ == "NVMLError_NoPermission":
                 raise PrivilegeError(
-                    "NVML refused the write (NVML_ERROR_NO_PERMISSION). Clock and "
-                    "power writes require root on Linux. Re-run under sudo. This "
-                    "is a hard failure, not a no-op -- nothing was changed."
+                    "NVML refused the write (NVML_ERROR_NO_PERMISSION). Clock "
+                    "and power writes require root on Linux. Re-run under sudo. "
+                    "This is a hard failure, not a no-op -- nothing changed."
                 ) from exc
             raise
 
@@ -277,26 +350,11 @@ class NvmlGpuController:
                 pass
 
 
-def _same_owner(current, owner) -> bool:
-    """True if `owner` may claim a controller `current` already holds.
-
-    Identity first (guards are objects), then equality, because the recovery
-    path claims with a string literal and `is` on strings only works via
-    CPython interning.
-    """
-    if current is None or current is owner:
-        return True
-    try:
-        return bool(current == owner)
-    except Exception:
-        return False
-
-
 def _text(v) -> str:
     return v.decode() if isinstance(v, bytes) else str(v)
 
 
-class FakeGpuController:
+class FakeGpuController(_ClaimMixin):
     """In-memory controller. Lets every crash path be tested without a GPU."""
 
     def __init__(
@@ -316,20 +374,6 @@ class FakeGpuController:
         self._claimed_by = None
         #: Simulates a broken restore, so tests can prove they discriminate.
         self.fail_restore = fail_restore
-
-    def claim(self, owner) -> None:
-        if not _same_owner(self._claimed_by, owner):
-            raise GpuGuardError(
-                f"controller already claimed by {self._claimed_by!r}"
-            )
-        self._claimed_by = owner
-
-    def _require_claim(self) -> None:
-        if self._claimed_by is None:
-            raise GpuGuardError(
-                "Refusing a direct hardware write: controller not held by a "
-                "GpuGuard."
-            )
 
     def snapshot(self) -> DeviceSnapshot:
         return DeviceSnapshot(
@@ -373,7 +417,7 @@ class FakeGpuController:
 
 
 # ---------------------------------------------------------------------------
-# Persisted state
+# Persisted state -- ONE record, because only one guard may arm at a time
 # ---------------------------------------------------------------------------
 
 
@@ -394,115 +438,29 @@ class GuardState:
     #: Set when a restore attempt FAILED. The device may still be modified.
     restore_failed: bool = False
     restore_errors: list = field(default_factory=list)
-    last_restore_attempt_utc: str | None = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
         d["_note"] = (
-            "clocks_locked is ASSERTED by the writing process, not observed from "
-            "the device -- this driver exposes no way to read back a clock lock. "
-            "restored:false means a process died holding GPU state; run "
+            "clocks_locked is ASSERTED by the writing process, not observed "
+            "from the device -- this driver exposes no way to read back a clock "
+            "lock. restored:false means a process left GPU state behind; run "
             "`python -m joule_agent.gpu_guard restore` (as root)."
         )
         return d
 
 
-STATE_SCHEMA = 2
+def _write_state(path: Path, state: GuardState) -> None:
+    """Publish the record atomically, fsynced, before any hardware write.
 
-#: Per-thread set of state-lock paths already held, so nested acquisition
-#: (signal handler re-entering a write) does not self-deadlock on flock.
-_HELD_STATE_LOCKS = threading.local()
-
-
-def _state_lock(path: Path):
-    """Inter-process lock around the state file's read-modify-write.
-
-    Per-pid tmp names stopped one process renaming another's file away, but the
-    document is still read, merged and rewritten wholesale -- two processes can
-    interleave and the later writer silently drops the earlier one's record. A
-    dropped record with restored:false is a GPU whose power cap never gets
-    restored, because recovery only rewrites power when a record says this repo
-    changed it.
-
-    POSIX only. Where flock is unavailable this degrades to a no-op with a
-    warning rather than failing: losing a record is bad, refusing to record
-    intent at all is worse.
+    No inter-process locking and no merging: arming is refused while any
+    unrestored record exists, so two guards never write concurrently by
+    construction. Operator-initiated recovery is the only other writer and is a
+    deliberate act.
     """
-
-    class _Lock:
-        def __init__(self, p):
-            self.path = p.with_suffix(p.suffix + ".lock")
-            self.fd = None
-            self.reentrant = False
-
-        def __enter__(self):
-            # flock locks attach to the OPEN FILE DESCRIPTION, not the process:
-            # reacquiring on a fresh fd from a thread that already holds this
-            # lock blocks forever. That is reachable on the signal path -- a
-            # SIGINT during _mark_touched's state write runs the handler on the
-            # same thread, which re-enters _write_state_atomic. The outer holder
-            # already provides exclusion, so nested acquisition is a no-op.
-            key = str(self.path)
-            held = getattr(_HELD_STATE_LOCKS, "paths", None)
-            if held is None:
-                held = _HELD_STATE_LOCKS.paths = set()
-            if key in held:
-                self.reentrant = True
-                return self
-            try:
-                import fcntl
-            except ImportError:  # pragma: no cover - non-POSIX
-                print(
-                    "WARNING [gpu_guard]: fcntl unavailable; state-file writes "
-                    "are unlocked and concurrent guards may lose records.",
-                    file=sys.stderr,
-                )
-                return self
-            try:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                self.fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
-                fcntl.flock(self.fd, fcntl.LOCK_EX)
-                held.add(key)
-            except OSError as exc:  # pragma: no cover - fs dependent
-                print(
-                    f"WARNING [gpu_guard]: could not lock {self.path} ({exc}); "
-                    "proceeding unlocked.",
-                    file=sys.stderr,
-                )
-                if self.fd is not None:
-                    os.close(self.fd)
-                    self.fd = None
-            return self
-
-        def __exit__(self, *exc):
-            if self.reentrant:
-                return False    # the outer acquisition owns release
-            if self.fd is not None:
-                try:
-                    import fcntl
-
-                    fcntl.flock(self.fd, fcntl.LOCK_UN)
-                finally:
-                    os.close(self.fd)
-                    self.fd = None
-                    held = getattr(_HELD_STATE_LOCKS, "paths", None)
-                    if held is not None:
-                        held.discard(str(self.path))
-            return False
-
-    return _Lock(path)
-
-
-def _write_doc_atomic(path: Path, doc: dict) -> None:
-    """Atomically publish `doc`. Caller holds the state lock when merging."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Unique per process AND per thread. Keying on pid alone lets two threads in
-    # one process truncate the same tmp -- the intra-process form of the
-    # cross-process collision that per-pid naming fixed. Deliberately NOT
-    # tempfile.mkstemp: that creates 0600, os.replace preserves the mode, and a
-    # root-written state file would become unreadable by the unprivileged
-    # `gpu_guard status` command that the recovery flow depends on.
-    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
+    doc = {"schema": STATE_SCHEMA, "record": state.to_dict()}
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
     with open(tmp, "w") as fh:
         json.dump(doc, fh, indent=2)
         fh.flush()
@@ -518,38 +476,33 @@ def _write_doc_atomic(path: Path, doc: dict) -> None:
         pass
 
 
-def _write_state_atomic(path: Path, state: GuardState) -> None:
-    """Merge this guard's record into the shared document and publish it.
-
-    Records are keyed by pid so a second guard's clean restore cannot overwrite
-    a first guard's un-restored record. The whole read-merge-write runs under
-    the inter-process lock.
-    """
-    with _state_lock(path):
-        doc = _read_doc(path)
-        doc["schema"] = STATE_SCHEMA
-        doc.setdefault("guards", {})[str(state.pid)] = state.to_dict()
-        _write_doc_atomic(path, doc)
-
-
-def _read_doc(path: Path) -> dict:
+def _read_record(path: Path) -> dict | None:
+    """Read the record, tolerating the two older on-disk shapes."""
     try:
         doc = json.loads(Path(path).read_text())
     except Exception:
-        return {}
+        return None
     if not isinstance(doc, dict):
-        return {}
-    if "guards" not in doc:
-        # Schema 1: a single bare record. Migrate it in memory so old state
-        # files from a previous run remain recoverable.
-        if "pid" in doc:
-            return {"schema": 1, "guards": {str(doc.get("pid")): doc}}
-        return {}
-    return doc
+        return None
+    if "record" in doc:                      # schema 3
+        return doc["record"]
+    if "guards" in doc:                      # schema 2: prefer an unrestored one
+        recs = list(doc["guards"].values())
+        for r in recs:
+            if not r.get("restored", True):
+                return r
+        return recs[0] if recs else None
+    if "pid" in doc:                         # schema 1: a bare record
+        return doc
+    return None
 
 
-def _all_records(path: Path) -> list:
-    return list(_read_doc(path).get("guards", {}).values())
+def _pid_alive(pid) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -575,23 +528,10 @@ class GpuGuard:
         self._require_root = require_root
         self._min_clock = min_clock_mhz
 
-        self._lock = threading.RLock()
         self._depth = 0
-        self._write_depth = 0
-        #: Bumped by every _mark_touched(). A restore captures it on entry and
-        #: refuses to record success if it moved, which catches a write that
-        #: both starts and finishes inside the restore window -- a depth check
-        #: alone would see 0 at entry and 0 at exit and miss it.
-        self._write_gen = 0
-        #: Bumped every time a restore records success. The writer samples it
-        #: before recording intent and re-checks in its finally. Testing
-        #: `if self._restored:` alone tests a LEVEL: a restore that completed
-        #: entirely inside the write's window leaves _restored True and is
-        #: caught, but one that completes just after the writer's check is not.
-        #: Comparing the counter tests the EDGE instead.
-        self._restore_gen = 0
         self._armed = False
         self._restored = True
+        self._owner_thread: int | None = None
         self._prev_handlers: dict = {}
         self._atexit_registered = False
         self.handler_install_failures: list = []
@@ -599,15 +539,15 @@ class GpuGuard:
         self.snapshot: DeviceSnapshot | None = None
         self.state: GuardState | None = None
 
-    # -- guards ----------------------------------------------------------
+    # -- refusals --------------------------------------------------------
 
     def _check_consent(self) -> None:
         if not self._consent:
             raise ConsentError(
                 "Refusing to change GPU settings without explicit consent. Pass "
-                f"consent=True (CLI: {CONSENT_FLAG}). This flag exists because "
-                "clock and power writes affect hardware shared with everything "
-                "else running on this machine. Reads never require it."
+                f"consent=True (CLI: {CONSENT_FLAG}). Clock and power writes "
+                "affect hardware shared with everything else on this machine. "
+                "Reads never require it."
             )
 
     def _check_privilege(self) -> None:
@@ -632,49 +572,92 @@ class GpuGuard:
                 f"Refusing clock lock: min {min_mhz} > max {max_mhz} MHz."
             )
 
+    def _check_owner_thread(self, action: str) -> None:
+        if self._owner_thread is None:
+            return
+        if threading.get_ident() != self._owner_thread:
+            raise ThreadAffinityError(
+                f"Refusing to {action} from thread "
+                f"{threading.current_thread().name!r}: this guard is owned by "
+                "the thread that armed it. The guard is deliberately "
+                "single-threaded -- a component that needs concurrency owns its "
+                "guard on one thread. See the module docstring."
+            )
+
+    def _check_not_busy(self) -> None:
+        prior = _read_record(self._state_path)
+        if not prior or prior.get("restored", True):
+            return
+        pid = prior.get("pid")
+        if pid == os.getpid():
+            return
+        if _pid_alive(pid):
+            raise GuardBusyError(
+                f"Refusing to arm: pid {pid} is running and holds an unrestored "
+                f"guard record in {self._state_path}. Only one guard may hold "
+                "the device at a time."
+            )
+        raise GuardBusyError(
+            f"Refusing to arm: pid {pid} died without restoring, and its record "
+            f"in {self._state_path} says the GPU may still be modified"
+            + (
+                f" (clock lock at [{prior.get('locked_min_mhz')}, "
+                f"{prior.get('locked_max_mhz')}] MHz)."
+                if prior.get("clocks_locked")
+                else "."
+            )
+            + " Run `sudo python -m joule_agent.gpu_guard restore` first. "
+            "Arming would overwrite the only evidence that exists."
+        )
+
     # -- lifecycle -------------------------------------------------------
 
     def arm(self) -> "GpuGuard":
         """Snapshot stock state and install every restore path."""
-        with self._lock:
-            if self._armed:
-                return self
-            claim = getattr(self._c, "claim", None)
-            if callable(claim):
-                claim(self)
-            self.snapshot = self._c.snapshot()
-            self.state = GuardState(
-                pid=os.getpid(),
-                started_utc=datetime.now(timezone.utc).isoformat(),
-                device_index=self.snapshot.index,
-                device_uuid=self.snapshot.uuid,
-                snapshot=self.snapshot.to_dict(),
-                restored=True,
-            )
-            self._install_handlers()
-            self._armed = True
+        if self._armed:
             return self
+        if threading.current_thread() is not threading.main_thread():
+            raise ThreadAffinityError(
+                "Refusing to arm off the main thread. Restore depends on signal "
+                "handlers, which only the main thread can install, so arming "
+                "elsewhere would silently degrade the guarantee to the state "
+                "file alone. Arm on the main thread, or give the worker its own "
+                "process."
+            )
+        self._check_not_busy()
+
+        claim = getattr(self._c, "claim", None)
+        if callable(claim):
+            claim(self)
+        self.snapshot = self._c.snapshot()
+        self.state = GuardState(
+            pid=os.getpid(),
+            started_utc=_utcnow(),
+            device_index=self.snapshot.index,
+            device_uuid=self.snapshot.uuid,
+            snapshot=self.snapshot.to_dict(),
+            restored=True,
+        )
+        self._owner_thread = threading.get_ident()
+        self._install_handlers()
+        self._armed = True
+        return self
 
     def _install_handlers(self) -> None:
         if not self._atexit_registered:
             atexit.register(self._atexit_restore)
             self._atexit_registered = True
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        for sig in _DEFERRED:
             try:
                 self._prev_handlers[sig] = signal.getsignal(sig)
                 signal.signal(sig, self._signal_restore)
-            except (ValueError, OSError) as exc:
-                # Not the main thread, or a platform without this signal.
-                # This DEGRADES the guarantee -- SIGTERM's default action
-                # terminates without running atexit -- so it must never be
-                # silent. Recovery then rests entirely on the state file.
+            except (ValueError, OSError) as exc:  # pragma: no cover
                 self.handler_install_failures.append(str(sig))
                 print(
                     f"WARNING [gpu_guard]: could not install a {sig!r} handler "
                     f"({type(exc).__name__}: {exc}). In-process restore on that "
                     "signal is NOT armed; recovery depends on the state file at "
-                    f"{self._state_path}. Arm the guard from the main thread to "
-                    "restore the guarantee.",
+                    f"{self._state_path}.",
                     file=sys.stderr,
                 )
 
@@ -682,7 +665,7 @@ class GpuGuard:
         try:
             self.restore()
         except Exception as exc:
-            # Cannot re-raise usefully at interpreter shutdown, but silence here
+            # Cannot re-raise usefully at interpreter shutdown, but silence
             # would hide a GPU left in a modified state.
             print(
                 f"ERROR [gpu_guard]: restore failed during exit: {exc}",
@@ -690,39 +673,16 @@ class GpuGuard:
             )
 
     def _signal_restore(self, signum, frame) -> None:
-        # A worker thread may hold self._lock. Signal handlers run on the main
-        # thread, so blocking here would make SIGINT/SIGTERM unresponsive and
-        # skip restore entirely. Bounded wait, then proceed regardless: restore
-        # is idempotent and the clock reset is a no-op on an unlocked GPU, so a
-        # racy restore is strictly safer than no restore.
-        acquired = self._lock.acquire(timeout=2.0)
+        # Hardware writes run with these signals blocked, so this handler can
+        # never observe a half-applied write. No in-flight bookkeeping needed.
         try:
-            # _restore_impl, not restore(): restore() would re-acquire this same
-            # RLock and block for as long as the worker holds it, making the
-            # bounded acquire above do nothing. Proceeding unlocked risks a race;
-            # restore is idempotent and the clock reset is a no-op on an
-            # unlocked GPU, so a racy restore beats no restore.
-            if not acquired:
-                print(
-                    "WARNING [gpu_guard]: lock held elsewhere; restoring without "
-                    "it to avoid hanging the signal handler.",
-                    file=sys.stderr,
-                )
-            self._restore_impl()
+            self.restore()
         except Exception as exc:
             print(
                 f"ERROR [gpu_guard]: restore failed handling {signum}: {exc}",
                 file=sys.stderr,
             )
-        finally:
-            if acquired:
-                try:
-                    self._lock.release()
-                except RuntimeError:
-                    pass
 
-        # Chaining happens after the try/except, never inside `finally` -- a
-        # `return` in a finally block silently discards any in-flight exception.
         prev = self._prev_handlers.get(signum)
         try:
             signal.signal(signum, prev if prev is not None else signal.SIG_DFL)
@@ -745,88 +705,52 @@ class GpuGuard:
         assert self.state is not None
         self.state.restored = False
         self._restored = False
-        self._write_gen += 1
-        _write_state_atomic(self._state_path, self.state)
+        _write_state(self._state_path, self.state)
 
     def lock_clocks(self, min_mhz: int, max_mhz: int | None = None) -> None:
         max_mhz = min_mhz if max_mhz is None else max_mhz
-        with self._lock:
-            if not self._armed:
-                self.arm()
-            self._check_consent()
-            # Argument validation BEFORE the environment check: a bad clock
-            # value is the caller's bug and is free to detect, so report it
-            # even when unprivileged. Checking root first would tell an
-            # operator to sudo and only then reveal the real problem --
-            # implying sudo would have made 100 MHz acceptable.
-            self._check_clock_floor(min_mhz, max_mhz)
-            self._check_privilege()
-            assert self.state is not None
-            self.state.clocks_locked = True
-            self.state.locked_min_mhz = min_mhz
-            self.state.locked_max_mhz = max_mhz
-            # Raised BEFORE _mark_touched(): an unlocked restore running on
-            # the signal path must see "write in flight" for the whole window,
-            # including the gap between recording intent and issuing the write.
-            self._write_depth += 1
-            restore_gen_before = self._restore_gen
-            try:
-                self._mark_touched()
-                self._c.set_locked_clocks(min_mhz, max_mhz)
-            finally:
-                self._write_depth -= 1
-                raced = self._restore_gen != restore_gen_before
-                # A signal handler can run BETWEEN _mark_touched() and the line
-                # above, re-enter restore() through the RLock, mark everything
-                # clean, and then let this frame resume and apply the lock. Any
-                # restore that overlapped this window is void.
-                if self._restored or raced:
-                    self._restored = False
-                    if self.state is not None:
-                        self.state.restored = False
-                        try:
-                            _write_state_atomic(self._state_path, self.state)
-                        except Exception:
-                            pass
+        if not self._armed:
+            self.arm()
+        self._check_owner_thread("lock clocks")
+        self._check_consent()
+        # Argument validation BEFORE the environment check: a bad clock value is
+        # the caller's bug and is free to detect, so report it even when
+        # unprivileged. Checking root first would send an operator to sudo and
+        # only then reveal the real problem.
+        self._check_clock_floor(min_mhz, max_mhz)
+        self._check_privilege()
+
+        assert self.state is not None
+        self.state.clocks_locked = True
+        self.state.locked_min_mhz = min_mhz
+        self.state.locked_max_mhz = max_mhz
+        with _deferred_signals():
+            self._mark_touched()
+            self._c.set_locked_clocks(min_mhz, max_mhz)
 
     def set_power_limit_mw(self, milliwatts: int) -> None:
-        with self._lock:
-            if not self._armed:
-                self.arm()
-            self._check_consent()
-            self._check_privilege()
-            snap = self.snapshot
-            if snap and snap.power_min_mw is not None and milliwatts < snap.power_min_mw:
-                raise GpuGuardError(
-                    f"Refusing power limit {milliwatts} mW: below the device "
-                    f"minimum {snap.power_min_mw} mW. Not clamped."
-                )
-            if snap and snap.power_max_mw is not None and milliwatts > snap.power_max_mw:
-                raise GpuGuardError(
-                    f"Refusing power limit {milliwatts} mW: above the device "
-                    f"maximum {snap.power_max_mw} mW. Not clamped."
-                )
-            assert self.state is not None
-            self.state.power_limit_written_mw = int(milliwatts)
-            # Raised BEFORE _mark_touched(): an unlocked restore running on
-            # the signal path must see "write in flight" for the whole window,
-            # including the gap between recording intent and issuing the write.
-            self._write_depth += 1
-            restore_gen_before = self._restore_gen
-            try:
-                self._mark_touched()
-                self._c.set_power_limit_mw(int(milliwatts))
-            finally:
-                self._write_depth -= 1
-                raced = self._restore_gen != restore_gen_before
-                if self._restored or raced:
-                    self._restored = False
-                    if self.state is not None:
-                        self.state.restored = False
-                        try:
-                            _write_state_atomic(self._state_path, self.state)
-                        except Exception:
-                            pass
+        if not self._armed:
+            self.arm()
+        self._check_owner_thread("set the power limit")
+        self._check_consent()
+        snap = self.snapshot
+        if snap and snap.power_min_mw is not None and milliwatts < snap.power_min_mw:
+            raise GpuGuardError(
+                f"Refusing power limit {milliwatts} mW: below the device "
+                f"minimum {snap.power_min_mw} mW. Not clamped."
+            )
+        if snap and snap.power_max_mw is not None and milliwatts > snap.power_max_mw:
+            raise GpuGuardError(
+                f"Refusing power limit {milliwatts} mW: above the device "
+                f"maximum {snap.power_max_mw} mW. Not clamped."
+            )
+        self._check_privilege()
+
+        assert self.state is not None
+        self.state.power_limit_written_mw = int(milliwatts)
+        with _deferred_signals():
+            self._mark_touched()
+            self._c.set_power_limit_mw(int(milliwatts))
 
     # -- restore ---------------------------------------------------------
 
@@ -836,126 +760,75 @@ class GpuGuard:
         The clock reset is issued unconditionally rather than gated on a
         readback, because no readback exists.
         """
-        with self._lock:
-            self._restore_impl()
+        if self._restored:
+            return
+        errors = []
+        try:
+            self._c.reset_locked_clocks()
+        except Exception as exc:
+            errors.append(f"reset_locked_clocks: {exc}")
 
-    def _restore_impl(self) -> None:
-        """Restore body WITHOUT taking the lock.
-
-        Split out so the signal path can proceed when the lock is held by
-        another thread. ``restore()`` re-entering the same RLock would make a
-        bounded acquire pointless -- the handler would simply block on the next
-        line instead.
-
-        Because this can run unlocked and concurrently with a write on another
-        thread, it must never record success when a write is in flight: the
-        write may apply its setting *after* the reset here and *before* the
-        marking here, leaving the GPU modified while memory and disk both say
-        clean. ``_write_depth`` and ``_write_gen`` are the two guards.
-        """
-        if True:
-            if self._restored:
-                return
-            gen_at_entry = self._write_gen
-            # Captured at ENTRY as well as checked at exit. A write already in
-            # flight when we start will have decremented the depth back to 0 by
-            # the time we finish, and its generation bump happened before we
-            # sampled -- so neither exit-side check alone would see it.
-            depth_at_entry = self._write_depth
-            errors = []
-            try:
-                self._c.reset_locked_clocks()
-            except Exception as exc:
-                errors.append(f"reset_locked_clocks: {exc}")
-
-            snap = self.snapshot
-            # Prefer what the limit ACTUALLY was when we armed, not the factory
-            # default: an operator may have set a deliberate cap before we ran,
-            # and restoring past it would silently undo their configuration.
-            target = snap.power_limit_mw if snap else None
-            if target is None and snap is not None:
-                target = snap.power_default_limit_mw
-            if self.state and self.state.power_limit_written_mw is not None:
-                if target is None:
-                    # We changed the limit but never learned what it was (both
-                    # NVML reads failed at arm() time). Silently skipping would
-                    # record success while leaving the cap in place.
-                    errors.append(
-                        "power limit was modified but no restore target is "
-                        "known (snapshot reads failed at arm time); the cap is "
-                        "still in effect"
-                    )
-                else:
-                    try:
-                        self._c.set_power_limit_mw(int(target))
-                    except Exception as exc:
-                        errors.append(f"set_power_limit_mw: {exc}")
-
-            if errors:
-                # DO NOT mark restored. The device may still be locked, and with
-                # no readback available the state file is the only evidence that
-                # exists -- recording success here would erase it precisely when
-                # it matters, and would disarm every remaining restore path
-                # (atexit, signals, a later explicit retry) for this process.
-                if self.state is not None:
-                    self.state.restored = False
-                    self.state.restore_failed = True
-                    self.state.restore_errors = list(errors)
-                    self.state.last_restore_attempt_utc = _utcnow()
-                    try:
-                        _write_state_atomic(self._state_path, self.state)
-                    except Exception:
-                        pass
-                raise GpuGuardError(
-                    "restore incomplete, GPU MAY STILL BE MODIFIED: "
-                    + "; ".join(errors)
-                    + f". State file {self._state_path} retains restored=false; "
-                    "run `sudo python -m joule_agent.gpu_guard restore`."
+        snap = self.snapshot
+        # Prefer what the limit ACTUALLY was when we armed, not the factory
+        # default: an operator may have set a deliberate cap before we ran.
+        target = snap.power_limit_mw if snap else None
+        if target is None and snap is not None:
+            target = snap.power_default_limit_mw
+        if self.state and self.state.power_limit_written_mw is not None:
+            if target is None:
+                errors.append(
+                    "power limit was modified but no restore target is known "
+                    "(snapshot reads failed at arm time); the cap is still in "
+                    "effect"
                 )
-
-            if (
-                depth_at_entry > 0
-                or self._write_depth > 0
-                or self._write_gen != gen_at_entry
-            ):
-                # A write overlapped this restore. The hardware reset above may
-                # have been undone by that write landing after it. Leave the
-                # guard armed and the state file dirty; the write's own finally,
-                # __exit__, atexit or an operator `restore` will settle it.
-                if self.state is not None:
-                    self.state.restored = False
-                    try:
-                        _write_state_atomic(self._state_path, self.state)
-                    except Exception:
-                        pass
-                return
-
-            self._restored = True
-            self._restore_gen += 1
-            if self.state is not None:
-                self.state.restored = True
-                self.state.restore_failed = False
-                self.state.restore_errors = []
-                self.state.clocks_locked = False
-                self.state.restored_utc = _utcnow()
+            else:
                 try:
-                    _write_state_atomic(self._state_path, self.state)
+                    self._c.set_power_limit_mw(int(target))
+                except Exception as exc:
+                    errors.append(f"set_power_limit_mw: {exc}")
+
+        if errors:
+            # DO NOT mark restored. With no readback, the state file is the only
+            # evidence that exists -- recording success would erase it exactly
+            # when it matters, and disarm every remaining restore path.
+            if self.state is not None:
+                self.state.restored = False
+                self.state.restore_failed = True
+                self.state.restore_errors = list(errors)
+                try:
+                    _write_state(self._state_path, self.state)
                 except Exception:
                     pass
+            raise GpuGuardError(
+                "restore incomplete, GPU MAY STILL BE MODIFIED: "
+                + "; ".join(errors)
+                + f". State file {self._state_path} retains restored=false; run "
+                "`sudo python -m joule_agent.gpu_guard restore`."
+            )
+
+        self._restored = True
+        if self.state is not None:
+            self.state.restored = True
+            self.state.restore_failed = False
+            self.state.restore_errors = []
+            self.state.clocks_locked = False
+            self.state.restored_utc = _utcnow()
+            try:
+                _write_state(self._state_path, self.state)
+            except Exception:
+                pass
 
     # -- context manager -------------------------------------------------
 
     def __enter__(self) -> "GpuGuard":
-        with self._lock:
-            self.arm()
-            self._depth += 1
-            return self
+        self.arm()
+        self._depth += 1
+        return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
-        with self._lock:
-            self._depth -= 1
-            if self._depth <= 0:
-                self.restore()
+        self._depth -= 1
+        if self._depth <= 0:
+            self.restore()
         return False  # never swallow the exception
 
 
@@ -976,7 +849,7 @@ def gpu_guard(
 
 
 # ---------------------------------------------------------------------------
-# Stale state
+# Stale state and recovery
 # ---------------------------------------------------------------------------
 
 
@@ -985,14 +858,14 @@ def check_stale_state(
 ) -> dict:
     """Detect GPU state left behind by a process that died without restoring.
 
-    Returns a report separating what the device confirms from what only the
-    state file asserts. The caller should surface both, labelled.
+    Separates what the device confirms from what only the state file asserts.
     """
     path = Path(state_path)
-    records = _all_records(path)
+    prior = _read_record(path)
     report = {
         "state_file": str(path),
         "state_file_present": path.exists(),
+        "power_readable": False,
         "verified_power_modified": False,
         "asserted_clock_lock": False,
         "restore_failed": False,
@@ -1011,40 +884,38 @@ def check_stale_state(
             "verifiable tier did not run. A clean result here does NOT mean the "
             "power limit is at default."
         )
-    if cur is not None and dfl is not None and cur != dfl:
+    elif cur != dfl:
         report["verified_power_modified"] = True
         report["stale"] = True
         # Deliberately does NOT claim this repo set the cap -- an operator may
-        # have configured it before we ever ran. Restoring blindly would undo
-        # their configuration, so the finding states the fact, not a cause.
+        # have configured it before we ever ran.
         report["findings"].append(
             f"VERIFIED (device): power limit is {cur} mW, device default is "
-            f"{dfl} mW. A cap is in effect. This may or may not have been set "
-            "by this repo -- check the state file records below before restoring."
+            f"{dfl} mW. A cap is in effect. This may or may not have been set by "
+            "this repo -- check the record below before restoring."
         )
 
     # Tier 2: assertion only -- the device cannot be asked about clock locks.
-    unrestored = [r for r in records if not r.get("restored", True)]
-    for rec in unrestored:
+    if prior and not prior.get("restored", True):
         report["stale"] = True
-        pid = rec.get("pid")
+        pid = prior.get("pid")
         alive = _pid_alive(pid) if pid else False
-        if rec.get("clocks_locked"):
-            report["asserted_clock_lock"] = True
-        if rec.get("restore_failed"):
+        report["writer_pid_alive"] = alive
+        report["asserted_clock_lock"] = bool(prior.get("clocks_locked"))
+        if prior.get("restore_failed"):
             report["restore_failed"] = True
             report["findings"].append(
                 f"RESTORE FAILED (state file): pid {pid} attempted a restore and "
-                f"it errored: {rec.get('restore_errors')}. The device is very "
+                f"it errored: {prior.get('restore_errors')}. The device is very "
                 "likely still modified."
             )
         report["findings"].append(
             f"ASSERTED (state file, NOT verifiable): pid {pid} recorded "
             f"restored=false"
             + (
-                f" and a clock lock at [{rec.get('locked_min_mhz')}, "
-                f"{rec.get('locked_max_mhz')}] MHz."
-                if rec.get("clocks_locked")
+                f" and a clock lock at [{prior.get('locked_min_mhz')}, "
+                f"{prior.get('locked_max_mhz')}] MHz."
+                if prior.get("clocks_locked")
                 else "."
             )
             + (
@@ -1053,24 +924,14 @@ def check_stale_state(
                 else " That pid is gone; it died without restoring."
             )
         )
-        report["writer_pid_alive"] = alive
-    report["unrestored_records"] = len(unrestored)
 
     if report["stale"]:
         report["recommendation"] = (
             "Run `sudo python -m joule_agent.gpu_guard restore` to return the "
-            "device to stock. Safe to run even if nothing is actually locked -- "
-            "the clock reset is a no-op on an unlocked GPU."
+            "device to stock. Safe even if nothing is actually locked -- the "
+            "clock reset is a no-op on an unlocked GPU."
         )
     return report
-
-
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, ValueError, TypeError):
-        return False
 
 
 def restore_from_state_file(
@@ -1080,27 +941,13 @@ def restore_from_state_file(
     force_power_default: bool = False,
 ) -> dict:
     """Recovery path for after a hard kill. Unconditional and idempotent."""
-    doc = _read_doc(Path(state_path))
-    all_records = list(doc.get("guards", {}).values())
-    # Only act on records for the device we are actually resetting. Clearing a
-    # record that names another GPU would erase evidence for a device this call
-    # never touched -- and clock-lock evidence has no device readback to rebuild
-    # it from.
-    dev = getattr(controller, "_index", None)
-    if dev is None:
-        try:
-            dev = controller.snapshot().index
-        except Exception:
-            dev = None
-    records = [
-        r for r in all_records
-        if dev is None or r.get("device_index") in (None, dev)
-    ]
-    result = {"reset_clocks": False, "power_restored_to_mw": None,
-              "records_cleared": 0, "errors": []}
-    skipped_other_device = len(all_records) - len(records)
-    if skipped_other_device:
-        result["skipped_other_device_records"] = skipped_other_device
+    prior = _read_record(Path(state_path))
+    result = {
+        "reset_clocks": False,
+        "power_restored_to_mw": None,
+        "record_cleared": False,
+        "errors": [],
+    }
 
     claim = getattr(controller, "claim", None)
     if callable(claim):
@@ -1112,71 +959,55 @@ def restore_from_state_file(
     except Exception as exc:
         result["errors"].append(f"reset_locked_clocks: {exc}")
 
-    # Restore power only if a record says WE changed it. Rewriting the limit
+    # Restore power only if the record says WE changed it. Rewriting the limit
     # unconditionally would wipe an operator's deliberate pre-existing cap.
-    wrote_power = [r for r in records if r.get("power_limit_written_mw") is not None]
+    wrote_power = bool(prior and prior.get("power_limit_written_mw") is not None)
     target = None
-    for r in wrote_power:
-        snap = r.get("snapshot") or {}
+    if wrote_power:
+        snap = (prior or {}).get("snapshot") or {}
         target = snap.get("power_limit_mw")
         if target is None:
             target = snap.get("power_default_limit_mw")
-        if target is not None:
-            break
     if target is None and force_power_default:
-        # Explicit operator override for when the state file was lost. Off by
-        # default because it cannot distinguish our cap from a deliberate one.
         target = controller.get_power_default_limit_mw()
         result["power_forced_to_default"] = True
-    if target is None and wrote_power and not force_power_default:
+    if target is None and wrote_power:
         result["errors"].append(
-            "a record shows this repo changed the power limit, but no restore "
+            "the record shows this repo changed the power limit, but no restore "
             "target is recoverable from its snapshot; the cap is still in "
             "effect. Re-run with --force-power-default to reset to the device "
             "default."
         )
-    if target is None and not wrote_power:
+    elif target is None:
         result["power_untouched_reason"] = (
             "no state record shows this repo changed the power limit; leaving it "
             "alone so a deliberate operator cap is not silently undone. Pass "
             "--force-power-default to override."
         )
-    if target is not None:
+    else:
         try:
             controller.set_power_limit_mw(int(target))
             result["power_restored_to_mw"] = int(target)
         except Exception as exc:
             result["errors"].append(f"set_power_limit_mw: {exc}")
 
-    if records and not result["errors"]:
-        for rec in records:
-            pid = rec.get("pid")
-            if pid and pid != os.getpid() and _pid_alive(pid):
-                # That process is still running and may still hold a lock.
-                # Clearing its record would erase live evidence.
-                result.setdefault("skipped_live_pids", []).append(pid)
-                continue
-            rec["restored"] = True
-            rec["clocks_locked"] = False
-            rec["restore_failed"] = False
-            rec["restored_utc"] = _utcnow()
-            rec["_recovered_by"] = "restore_from_state_file"
-            result["records_cleared"] += 1
+    if prior is not None and not result["errors"]:
+        prior = dict(prior)
+        prior["restored"] = True
+        prior["clocks_locked"] = False
+        prior["restore_failed"] = False
+        prior["restored_utc"] = _utcnow()
+        prior["_recovered_by"] = "restore_from_state_file"
         try:
-            # Re-read INSIDE the lock. `doc` was read before the NVML calls
-            # above, so publishing it would clobber any guard that recorded
-            # intent during that window -- locking only the write leaves the
-            # stale half of the read-modify-write unprotected.
-            with _state_lock(Path(state_path)):
-                fresh = _read_doc(Path(state_path))
-                fresh.setdefault("guards", {})
-                for pid_key, rec in doc.get("guards", {}).items():
-                    if rec.get("restored"):
-                        # Only publish records THIS recovery cleared; leave any
-                        # record that appeared meanwhile exactly as we found it.
-                        fresh["guards"][pid_key] = rec
-                fresh["schema"] = STATE_SCHEMA
-                _write_doc_atomic(Path(state_path), fresh)
+            path = Path(state_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+            with open(tmp, "w") as fh:
+                json.dump({"schema": STATE_SCHEMA, "record": prior}, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            result["record_cleared"] = True
         except Exception as exc:
             result["errors"].append(f"state_file: {exc}")
     return result
@@ -1223,6 +1054,7 @@ def main(argv=None) -> int:
 
     args = p.parse_args(argv)
     c = _controller(args)
+    guard = None
     try:
         if args.cmd == "status":
             rep = check_stale_state(c, args.state_path)
@@ -1231,18 +1063,15 @@ def main(argv=None) -> int:
 
         if args.cmd == "restore":
             res = restore_from_state_file(
-                c,
-                args.state_path,
-                force_power_default=getattr(args, "force_power_default", False),
+                c, args.state_path, force_power_default=args.force_power_default
             )
             print(json.dumps(res, indent=2))
             return 1 if res["errors"] else 0
 
         if args.cmd == "lock":
-            g = GpuGuard(c, consent=args.consent, state_path=args.state_path)
-            main._active_guard = g
-            with g:
-                g.lock_clocks(args.mhz)
+            guard = GpuGuard(c, consent=args.consent, state_path=args.state_path)
+            with guard:
+                guard.lock_clocks(args.mhz)
                 print(f"locked SM clock at {args.mhz} MHz; holding {args.hold}s")
                 if args.crash_after is not None:
                     time.sleep(args.crash_after)
@@ -1255,12 +1084,10 @@ def main(argv=None) -> int:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
     finally:
-        # Do NOT close while a guard still holds unrestored state: closing shuts
-        # NVML down, and the atexit last-chance restore would then fail against a
+        # Do NOT close while the guard still holds unrestored state: close()
+        # shuts NVML down, and the exit-time restore would then fail against a
         # dead handle -- converting a possible recovery into a certain failure.
-        held = getattr(main, "_active_guard", None)
-        main._active_guard = None   # never let one run suppress a later close
-        if held is not None and not held._restored:
+        if guard is not None and not guard._restored:
             print(
                 "WARNING [gpu_guard]: leaving NVML open so the exit-time restore "
                 "can still run.",

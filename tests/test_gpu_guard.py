@@ -33,17 +33,21 @@ from joule_agent.gpu_guard import (
     FakeGpuController,
     GpuGuard,
     GpuGuardError,
+    GuardBusyError,
     PrivilegeError,
+    ThreadAffinityError,
     check_stale_state,
     restore_from_state_file,
 )
 
 
 def record(state_path, pid=None) -> dict:
-    """Read one guard record from the per-pid state document."""
+    """Read the guard record. Schema 3 stores exactly one."""
     doc = json.loads(Path(state_path).read_text())
-    guards = doc["guards"]
-    return guards[str(pid)] if pid is not None else next(iter(guards.values()))
+    rec = doc["record"]
+    if pid is not None:
+        assert rec["pid"] == pid, f"record is for pid {rec['pid']}, wanted {pid}"
+    return rec
 
 
 def guard(tmp_path, **kw) -> GpuGuard:
@@ -567,27 +571,6 @@ def test_guard_claims_its_controller(tmp_path):
         assert c.locked == (1400, 1400)
 
 
-def test_concurrent_guards_do_not_clobber_each_others_records(tmp_path):
-    """F4: a clean restore by one guard must not erase another's live record."""
-    sp = tmp_path / "state.json"
-    a = FakeGpuController()
-    b = FakeGpuController()
-    ga = GpuGuard(a, consent=True, require_root=False, state_path=sp)
-    gb = GpuGuard(b, consent=True, require_root=False, state_path=sp)
-    ga.arm(); gb.arm()
-    ga.state.pid = 1111
-    gb.state.pid = 2222
-    ga.lock_clocks(1400)
-    gb.lock_clocks(900)
-    ga.restore()
-
-    doc = json.loads(sp.read_text())
-    assert doc["guards"]["1111"]["restored"] is True
-    assert doc["guards"]["2222"]["restored"] is False, "B's record was clobbered"
-    rep = check_stale_state(FakeGpuController(), sp)
-    assert rep["stale"] is True, "B still holds a lock but status reported clean"
-
-
 def test_power_limit_of_zero_is_still_restored(tmp_path):
     """F7: 0 mW is falsy; a truthiness gate skipped the restore entirely."""
     c = FakeGpuController(power_limit_mw=200_000, power_default_limit_mw=200_000)
@@ -661,21 +644,6 @@ def test_sig_ign_is_not_converted_into_process_death(tmp_path, monkeypatch):
         signal.signal(signal.SIGTERM, prev)
 
 
-def test_handler_install_failure_is_recorded_not_silent(tmp_path, capfd):
-    """F2: the load-bearing half is the stderr warning, not an in-memory list."""
-    import threading as _t
-
-    c = FakeGpuController()
-    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
-    th = _t.Thread(target=g.arm)
-    th.start(); th.join()
-
-    err = capfd.readouterr().err
-    assert g.handler_install_failures, "off-main-thread arm reported no degradation"
-    assert "WARNING [gpu_guard]" in err, "degradation was silent on stderr"
-    assert "not armed" in err.lower() or "NOT armed" in err
-
-
 def test_atexit_restore_reports_failure_on_stderr(tmp_path, capfd):
     """F3 had no coverage at all; a bare `except: pass` would pass silently."""
     c = RaisingRestore()
@@ -693,41 +661,6 @@ def test_atexit_restore_reports_failure_on_stderr(tmp_path, capfd):
 # ---------------------------------------------------------------------------
 
 
-def test_signal_during_a_write_does_not_record_a_false_clean(tmp_path):
-    """A signal handler can land BETWEEN the state write and the hardware write.
-
-    It re-enters restore() through the RLock, marks everything clean, returns,
-    and the interrupted frame then applies the lock -- GPU modified, disk clean.
-    """
-    sp = tmp_path / "state.json"
-
-    class SignalMidWrite(FakeGpuController):
-        guard = None
-        _fired = False
-
-        def set_locked_clocks(self, mn, mx):
-            self._require_claim()
-            if self.guard is not None and not self._fired:
-                self._fired = True
-                self.guard._signal_restore(signal.SIGTERM, None)
-            self.set_clock_calls += 1
-            self.locked = (mn, mx)
-
-    c = SignalMidWrite()
-    prev = signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    try:
-        g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
-        c.guard = g
-        g.arm()
-        g.lock_clocks(1400)
-        assert c.locked == (1400, 1400), "precondition: the lock was applied"
-        assert g._restored is False, "guard disarmed while the GPU is modified"
-        assert record(sp)["restored"] is False, "disk claims clean, GPU is locked"
-        assert check_stale_state(FakeGpuController(), sp)["stale"] is True
-    finally:
-        signal.signal(signal.SIGTERM, prev)
-
-
 def test_unknown_power_restore_target_is_an_error_not_a_skip(tmp_path):
     """If both snapshot reads failed, we cannot restore -- and must say so."""
     c = FakeGpuController(power_limit_mw=200_000, power_default_limit_mw=200_000)
@@ -741,90 +674,6 @@ def test_unknown_power_restore_target_is_an_error_not_a_skip(tmp_path):
     with pytest.raises(GpuGuardError, match="no restore target is known"):
         g.restore()
     assert g._restored is False
-
-
-CONCURRENT_CHILD = textwrap.dedent(
-    """
-    import sys, time
-    sys.path.insert(0, {repo!r})
-    from joule_agent.gpu_guard import GpuGuard, FakeGpuController
-
-    state_path, pid_tag, start_at = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
-    c = FakeGpuController()
-    g = GpuGuard(c, consent=True, require_root=False, state_path=state_path)
-    g.arm()
-    g.state.pid = pid_tag
-    # Busy-wait to a common wall-clock instant so every process performs its
-    # read-modify-write in the same window. ONE write each: repeated writes
-    # would self-heal a lost update and make this test unable to fail.
-    while time.time() < start_at:
-        pass
-    g._mark_touched()
-    """
-)
-
-
-def test_concurrent_processes_do_not_delete_each_others_records(tmp_path):
-    """V3/N3: the state document is read, merged and rewritten wholesale.
-
-    Without an inter-process lock, two writers each read the same document and
-    the later one silently drops the earlier one's record. A dropped record
-    with restored:false is a GPU whose power cap never gets restored, since
-    recovery only rewrites power when a record says this repo changed it.
-
-    Every process writes exactly once, released together, so a lost update
-    cannot be repaired by a subsequent write.
-    """
-    import time as _time
-
-    repo = str(Path(__file__).resolve().parent.parent)
-    script = tmp_path / "conc.py"
-    script.write_text(CONCURRENT_CHILD.format(repo=repo))
-    sp = tmp_path / "state.json"
-
-    n = 8
-    start_at = _time.time() + 3.0     # give every child time to reach the spin
-    procs = [
-        subprocess.Popen(
-            [sys.executable, str(script), str(sp), str(4000 + i), str(start_at)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        for i in range(n)
-    ]
-    errs = []
-    for pr in procs:
-        _, e = pr.communicate(timeout=120)
-        if pr.returncode != 0:
-            errs.append(e[-300:])
-    assert not errs, f"concurrent writers crashed: {errs[:2]}"
-
-    doc = json.loads(sp.read_text())
-    assert doc.get("schema") == 2
-    kept = sorted(int(k) for k in doc["guards"])
-    assert kept == [4000 + i for i in range(n)], (
-        f"records lost to concurrent writers: kept {kept}"
-    )
-
-
-def test_recovery_does_not_clear_a_live_writers_record(tmp_path):
-    """N9: clearing a running process's record erases live evidence."""
-    sp = tmp_path / "state.json"
-    sp.write_text(json.dumps({
-        "schema": 2,
-        "guards": {
-            str(os.getppid()): {"pid": os.getppid(), "restored": False,
-                                "clocks_locked": True, "snapshot": {}},
-            "999999": {"pid": 999999, "restored": False,
-                       "clocks_locked": True, "snapshot": {}},
-        },
-    }))
-    c = FakeGpuController()
-    res = restore_from_state_file(c, sp)
-    doc = json.loads(sp.read_text())
-    assert doc["guards"]["999999"]["restored"] is True, "dead record not cleared"
-    assert doc["guards"][str(os.getppid())]["restored"] is False, \
-        "cleared a record belonging to a live process"
-    assert os.getppid() in res.get("skipped_live_pids", [])
 
 
 def test_claim_is_exclusive(tmp_path):
@@ -855,123 +704,6 @@ def test_status_flags_unreadable_power_rather_than_implying_clean(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_restore_racing_a_write_on_another_thread_does_not_report_clean(tmp_path):
-    """V1: the unlocked signal path can overlap a write on a worker thread.
-
-    The write applies its setting AFTER the restore's reset and BEFORE the
-    restore's marking, so an exit-side check alone sees depth back at 0 and an
-    unchanged generation. The guard must capture in-flight state at entry.
-    """
-    sp = tmp_path / "state.json"
-    hw_entered = threading.Event()
-    may_finish = threading.Event()
-    finally_ran = threading.Event()
-
-    class Interleave(FakeGpuController):
-        def set_locked_clocks(self, mn, mx):
-            self._require_claim()
-            hw_entered.set()
-            may_finish.wait(10)
-            self.set_clock_calls += 1
-            self.locked = (mn, mx)          # applied AFTER the reset below
-
-        def reset_locked_clocks(self):
-            self._require_claim()
-            self.reset_calls += 1
-            self.locked = None
-            may_finish.set()                # let the writer land now
-            finally_ran.wait(10)            # ...before we mark anything
-
-    c = Interleave()
-    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
-    g.arm()
-
-    def worker():
-        g.lock_clocks(1400)
-        finally_ran.set()
-
-    w = threading.Thread(target=worker)
-    w.start()
-    assert hw_entered.wait(10)
-    g._restore_impl()                        # signal path, unlocked
-    w.join(15)
-
-    assert c.locked == (1400, 1400), "precondition: the write landed"
-    assert g._restored is False, "guard disarmed while the GPU is modified"
-    assert record(sp)["restored"] is False, "disk reports clean, GPU is locked"
-    assert check_stale_state(FakeGpuController(), sp)["stale"] is True
-
-
-def test_write_gen_clause_catches_a_write_inside_the_restore_window(tmp_path):
-    """Isolates the _write_gen clause specifically.
-
-    depth_at_entry cannot catch a write that both STARTS and FINISHES inside
-    the restore window -- depth is 0 at entry and 0 at exit. Only the
-    generation comparison sees it. The source-text assertion this replaces was
-    satisfied by _restore_impl's own docstring and could not fail.
-    """
-    sp = tmp_path / "state.json"
-    c = FakeGpuController()
-    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
-    g.arm()
-
-    fired = {"n": 0}
-    real_reset = c.reset_locked_clocks
-
-    def reset_then_write():
-        real_reset()
-        if fired["n"] == 0:
-            fired["n"] = 1
-            # A whole write begins and completes here, inside the restore.
-            g.lock_clocks(1400)
-
-    c.reset_locked_clocks = reset_then_write
-    g._mark_touched()          # make the guard dirty so restore proceeds
-    g._restore_impl()
-
-    assert c.locked == (1400, 1400), "precondition: the nested write landed"
-    assert g._restored is False, "restore marked clean over a completed write"
-    assert record(sp)["restored"] is False
-
-
-def test_signal_path_does_not_block_behind_a_held_lock(tmp_path, monkeypatch):
-    """N4: restore() re-acquiring the same RLock made the bounded acquire moot.
-
-    os.kill is stubbed because _signal_restore re-raises the signal on the way
-    out, which would terminate the test runner itself.
-    """
-    import joule_agent.gpu_guard as gg
-
-    monkeypatch.setattr(gg.os, "kill", lambda pid, sig: None)
-    c = FakeGpuController()
-    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
-    g.arm()
-    g.lock_clocks(1400)
-
-    holder_in = threading.Event()
-    release = threading.Event()
-
-    def holder():
-        with g._lock:
-            holder_in.set()
-            release.wait(30)
-
-    th = threading.Thread(target=holder)
-    th.start()
-    assert holder_in.wait(10)
-    try:
-        t0 = time.monotonic()
-        g._signal_restore(signal.SIGTERM, None)
-        elapsed = time.monotonic() - t0
-    finally:
-        release.set()
-        th.join(10)
-
-    # Bounded acquire is 2s; blocking on restore() would run to the 30s holder.
-    assert elapsed < 10, f"signal handler blocked {elapsed:.1f}s behind the lock"
-    assert c.locked is None, "restore did not run"
-
-
 def test_recovery_writes_state_file_atomically(tmp_path):
     """N7: recovery used plain write_text -- a crash mid-write truncates the
     only evidence, which _read_doc then reports as 'no guard ever ran'."""
@@ -992,40 +724,6 @@ def test_recovery_writes_state_file_atomically(tmp_path):
         gg.os.replace = real
     assert seen, "recovery published the state file without an atomic rename"
     assert seen[-1][1] == str(sp)
-
-
-def test_state_tmp_name_is_unique_per_thread(tmp_path):
-    """V4: keying the tmp name on pid alone lets two threads collide."""
-    import joule_agent.gpu_guard as gg
-
-    names = []
-    real_open = open
-
-    def spy_open(path, *a, **kw):
-        if str(path).endswith(".tmp"):
-            names.append(str(path))
-        return real_open(path, *a, **kw)
-
-    sp = tmp_path / "state.json"
-    monkey = gg.__dict__
-    monkey["open"] = spy_open
-    try:
-        def w(tag):
-            c = FakeGpuController()
-            g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
-            g.arm()
-            g.state.pid = tag
-            g._mark_touched()
-
-        ths = [threading.Thread(target=w, args=(3000 + i,)) for i in range(4)]
-        for th in ths:
-            th.start()
-        for th in ths:
-            th.join(20)
-    finally:
-        monkey.pop("open", None)
-
-    assert len(names) == len(set(names)), f"tmp name collision across threads: {names}"
 
 
 def test_main_does_not_close_nvml_while_state_is_unrestored(tmp_path, monkeypatch):
@@ -1073,90 +771,180 @@ def test_nvml_controller_claim_is_exclusive():
         c.claim("owner-b")
 
 
-def test_state_lock_never_blocks_on_a_lock_this_thread_holds(tmp_path, monkeypatch):
-    """flock attaches to the OPEN FILE DESCRIPTION, not the process.
 
-    _state_lock opens a fresh fd per acquisition, so a nested acquisition on
-    the same thread blocks forever unless it is made reentrant. That is
-    reachable on the signal path: a SIGINT during _mark_touched's state write
-    runs the handler on the same thread, which re-enters _write_state_atomic.
-    The result is a HANG on the Ctrl+C path -- the exact path the guard exists
-    to protect.
+# ---------------------------------------------------------------------------
+# the two structural refusals -- load-bearing safety behaviour
+# ---------------------------------------------------------------------------
 
-    Asserts the second blocking flock is never ATTEMPTED, rather than
-    attempting it and timing out: a test that reproduces a deadlock wedges the
-    suite instead of failing it.
-    """
-    import fcntl
 
-    import joule_agent.gpu_guard as gg
+def test_arming_off_the_main_thread_is_refused_cleanly(tmp_path):
+    """Restore depends on signal handlers, which only the main thread can
+    install. Arming elsewhere would silently degrade the guarantee to the state
+    file alone, so it is refused rather than allowed-with-a-warning."""
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
 
-    ex_calls = []
-    real_flock = fcntl.flock
+    caught = []
 
-    def counting_flock(fd, op):
-        if op & fcntl.LOCK_EX:
-            if ex_calls:
-                # Performing this would block forever on the lock this thread
-                # already holds -- which would wedge the suite instead of
-                # failing it. Refuse, so a regression surfaces as a fast error.
-                raise RuntimeError(
-                    "second blocking flock attempted while this thread already "
-                    "holds the state lock: this would deadlock"
-                )
-            ex_calls.append(fd)
-        elif op & fcntl.LOCK_UN and fd in ex_calls:
-            ex_calls.remove(fd)
-            ex_calls.append(fd)  # keep the count for the assertion
-        return real_flock(fd, op)
+    def worker():
+        try:
+            g.arm()
+        except BaseException as exc:      # must be a clean refusal, not a crash
+            caught.append(exc)
 
-    monkeypatch.setattr(fcntl, "flock", counting_flock)
+    th = threading.Thread(target=worker)
+    th.start()
+    th.join(10)
 
+    assert caught, "arming off the main thread was allowed"
+    exc = caught[0]
+    assert isinstance(exc, ThreadAffinityError), f"got {type(exc).__name__}"
+    assert "main thread" in str(exc)
+    assert c.set_clock_calls == 0
+    assert not (tmp_path / "s.json").exists(), "a refused arm wrote state"
+
+
+def test_writing_from_a_non_owner_thread_is_refused(tmp_path):
+    """Armed on the main thread, then written from a worker."""
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
+    g.arm()
+
+    caught = []
+
+    def worker():
+        try:
+            g.lock_clocks(1400)
+        except BaseException as exc:
+            caught.append(exc)
+
+    th = threading.Thread(target=worker)
+    th.start()
+    th.join(10)
+
+    assert caught, "a worker thread was allowed to write"
+    assert isinstance(caught[0], ThreadAffinityError)
+    assert c.set_clock_calls == 0, "hardware was touched from a non-owner thread"
+    assert c.locked is None
+
+
+def test_arming_while_a_live_pid_holds_a_record_is_refused(tmp_path):
+    """One guard per machine. A live holder means another guard is running."""
     sp = tmp_path / "state.json"
-    with gg._state_lock(sp) as outer:
-        assert outer.reentrant is False
-        with gg._state_lock(sp) as inner:
-            assert inner.reentrant is True, "nested acquisition was not reentrant"
-            assert inner.fd is None, "nested acquisition opened a second fd"
-    assert len(ex_calls) == 1, (
-        f"took {len(ex_calls)} exclusive flocks for a nested acquisition; the "
-        "second would block forever on the first"
-    )
-
-
-def test_state_write_reentered_under_a_held_lock_completes(tmp_path, monkeypatch):
-    """End-to-end form: a state write re-entered while this thread already
-    holds the state lock must complete, not block."""
-    import fcntl
-
-    import joule_agent.gpu_guard as gg
-
-    ex_calls = []
-    real_flock = fcntl.flock
-
-    def counting_flock(fd, op):
-        if op & fcntl.LOCK_EX:
-            if ex_calls:
-                # Performing this would block forever on the lock this thread
-                # already holds -- which would wedge the suite instead of
-                # failing it. Refuse, so a regression surfaces as a fast error.
-                raise RuntimeError(
-                    "second blocking flock attempted while this thread already "
-                    "holds the state lock: this would deadlock"
-                )
-            ex_calls.append(fd)
-        elif op & fcntl.LOCK_UN and fd in ex_calls:
-            ex_calls.remove(fd)
-            ex_calls.append(fd)  # keep the count for the assertion
-        return real_flock(fd, op)
-
-    monkeypatch.setattr(fcntl, "flock", counting_flock)
-
-    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({
+        "schema": 3,
+        "record": {"pid": os.getppid(), "restored": False, "clocks_locked": True,
+                   "locked_min_mhz": 900, "locked_max_mhz": 900, "snapshot": {}},
+    }))
     c = FakeGpuController()
     g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
-    g.arm()
-    with gg._state_lock(sp):
-        g._mark_touched()               # re-enters _write_state_atomic
-    assert len(ex_calls) == 1, "the nested state write took a second flock"
+    with pytest.raises(GuardBusyError, match="is running"):
+        g.arm()
+    assert c.set_clock_calls == 0
+    # the other guard's record must survive untouched
     assert record(sp)["restored"] is False
+
+
+def test_arming_after_a_dead_pid_left_a_record_is_refused(tmp_path):
+    """A dead holder means recovery is owed. Arming would overwrite the only
+    evidence that the GPU may still be modified."""
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({
+        "schema": 3,
+        "record": {"pid": 999999, "restored": False, "clocks_locked": True,
+                   "locked_min_mhz": 900, "locked_max_mhz": 900, "snapshot": {}},
+    }))
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+    with pytest.raises(GuardBusyError, match="died without restoring"):
+        g.arm()
+    assert "gpu_guard restore" in str(
+        pytest.raises(GuardBusyError, g.arm).value
+    ), "the refusal must name the recovery command"
+    assert record(sp)["restored"] is False, "the evidence was overwritten"
+
+
+def test_arming_proceeds_when_the_prior_record_is_restored(tmp_path):
+    """The refusal must not wedge normal operation."""
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({
+        "schema": 3,
+        "record": {"pid": 999999, "restored": True, "clocks_locked": False,
+                   "snapshot": {}},
+    }))
+    c = FakeGpuController()
+    with GpuGuard(c, consent=True, require_root=False, state_path=sp) as g:
+        g.lock_clocks(1400)
+        assert c.locked == (1400, 1400)
+    assert c.locked is None
+
+
+def test_our_own_record_does_not_block_re_arming(tmp_path):
+    """A guard re-arming in the same process must not block on itself."""
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
+    g.arm()
+    g.lock_clocks(1400)          # leaves restored=false for THIS pid
+    g.arm()                      # idempotent, must not raise
+    assert g._armed
+
+
+# ---------------------------------------------------------------------------
+# the same-thread hazard is now closed by construction
+# ---------------------------------------------------------------------------
+
+
+def test_signals_are_blocked_for_the_duration_of_a_hardware_write(tmp_path):
+    """Replaces the in-flight bookkeeping that four review passes kept breaking.
+
+    A handler running between "record intent" and "issue the write" could reset
+    the device and mark clean, after which the interrupted frame applies the
+    setting. Blocking the signals makes that interleaving unrepresentable
+    rather than merely detectable.
+    """
+    observed = {}
+
+    class CheckMask(FakeGpuController):
+        def set_locked_clocks(self, mn, mx):
+            self._require_claim()
+            observed["blocked"] = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+            self.set_clock_calls += 1
+            self.locked = (mn, mx)
+
+    c = CheckMask()
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    with GpuGuard(c, consent=True, require_root=False,
+                  state_path=tmp_path / "s.json") as g:
+        g.lock_clocks(1400)
+    after = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+
+    assert signal.SIGINT in observed["blocked"], "SIGINT was deliverable mid-write"
+    assert signal.SIGTERM in observed["blocked"], "SIGTERM was deliverable mid-write"
+    assert after == before, "the signal mask was not restored after the write"
+
+
+def test_a_signal_raised_during_a_write_is_delivered_after_it(tmp_path):
+    """Blocked, not lost: the pending signal must arrive once the write ends."""
+    delivered = []
+    original = signal.getsignal(signal.SIGTERM)
+
+    class RaiseMidWrite(FakeGpuController):
+        def set_locked_clocks(self, mn, mx):
+            self._require_claim()
+            os.kill(os.getpid(), signal.SIGTERM)   # blocked -> stays pending
+            assert not delivered, "handler ran mid-write despite the block"
+            self.set_clock_calls += 1
+            self.locked = (mn, mx)
+
+    try:
+        signal.signal(signal.SIGTERM, lambda *a: delivered.append(True))
+        c = RaiseMidWrite()
+        g = GpuGuard(c, consent=True, require_root=False,
+                     state_path=tmp_path / "s.json")
+        g.arm()
+        signal.signal(signal.SIGTERM, lambda *a: delivered.append(True))
+        g.lock_clocks(1400)
+        assert c.locked == (1400, 1400)
+        assert delivered, "the pending signal was swallowed, not deferred"
+    finally:
+        signal.signal(signal.SIGTERM, original)
