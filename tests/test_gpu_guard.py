@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from pathlib import Path
 
@@ -744,49 +745,65 @@ def test_unknown_power_restore_target_is_an_error_not_a_skip(tmp_path):
 
 CONCURRENT_CHILD = textwrap.dedent(
     """
-    import sys
+    import sys, time
     sys.path.insert(0, {repo!r})
     from joule_agent.gpu_guard import GpuGuard, FakeGpuController
 
-    state_path, pid_tag = sys.argv[1], int(sys.argv[2])
+    state_path, pid_tag, start_at = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
     c = FakeGpuController()
     g = GpuGuard(c, consent=True, require_root=False, state_path=state_path)
     g.arm()
     g.state.pid = pid_tag
-    for _ in range(60):
-        g._mark_touched()
+    # Busy-wait to a common wall-clock instant so every process performs its
+    # read-modify-write in the same window. ONE write each: repeated writes
+    # would self-heal a lost update and make this test unable to fail.
+    while time.time() < start_at:
+        pass
+    g._mark_touched()
     """
 )
 
 
 def test_concurrent_processes_do_not_delete_each_others_records(tmp_path):
-    """N3: a shared `.tmp` name let one process rename another's file away.
+    """V3/N3: the state document is read, merged and rewritten wholesale.
 
-    That produced FileNotFoundError in os.replace and deleted records outright
-    -- strictly worse than the single-record clobbering the schema replaced.
+    Without an inter-process lock, two writers each read the same document and
+    the later one silently drops the earlier one's record. A dropped record
+    with restored:false is a GPU whose power cap never gets restored, since
+    recovery only rewrites power when a record says this repo changed it.
+
+    Every process writes exactly once, released together, so a lost update
+    cannot be repaired by a subsequent write.
     """
+    import time as _time
+
     repo = str(Path(__file__).resolve().parent.parent)
     script = tmp_path / "conc.py"
     script.write_text(CONCURRENT_CHILD.format(repo=repo))
     sp = tmp_path / "state.json"
 
+    n = 8
+    start_at = _time.time() + 3.0     # give every child time to reach the spin
     procs = [
         subprocess.Popen(
-            [sys.executable, str(script), str(sp), str(2000 + i)],
+            [sys.executable, str(script), str(sp), str(4000 + i), str(start_at)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        for i in range(6)
+        for i in range(n)
     ]
     errs = []
     for pr in procs:
-        _, e = pr.communicate(timeout=90)
+        _, e = pr.communicate(timeout=120)
         if pr.returncode != 0:
             errs.append(e[-300:])
     assert not errs, f"concurrent writers crashed: {errs[:2]}"
 
     doc = json.loads(sp.read_text())
     assert doc.get("schema") == 2
-    assert len(doc["guards"]) >= 1, "all records were destroyed"
+    kept = sorted(int(k) for k in doc["guards"])
+    assert kept == [4000 + i for i in range(n)], (
+        f"records lost to concurrent writers: kept {kept}"
+    )
 
 
 def test_recovery_does_not_clear_a_live_writers_record(tmp_path):
@@ -831,3 +848,185 @@ def test_status_flags_unreadable_power_rather_than_implying_clean(tmp_path):
     rep = check_stale_state(Unreadable(), tmp_path / "none.json")
     assert rep["power_readable"] is False
     assert any("UNKNOWN" in f for f in rep["findings"])
+
+
+# ---------------------------------------------------------------------------
+# pass-3 regressions
+# ---------------------------------------------------------------------------
+
+
+def test_restore_racing_a_write_on_another_thread_does_not_report_clean(tmp_path):
+    """V1: the unlocked signal path can overlap a write on a worker thread.
+
+    The write applies its setting AFTER the restore's reset and BEFORE the
+    restore's marking, so an exit-side check alone sees depth back at 0 and an
+    unchanged generation. The guard must capture in-flight state at entry.
+    """
+    sp = tmp_path / "state.json"
+    hw_entered = threading.Event()
+    may_finish = threading.Event()
+    finally_ran = threading.Event()
+
+    class Interleave(FakeGpuController):
+        def set_locked_clocks(self, mn, mx):
+            self._require_claim()
+            hw_entered.set()
+            may_finish.wait(10)
+            self.set_clock_calls += 1
+            self.locked = (mn, mx)          # applied AFTER the reset below
+
+        def reset_locked_clocks(self):
+            self._require_claim()
+            self.reset_calls += 1
+            self.locked = None
+            may_finish.set()                # let the writer land now
+            finally_ran.wait(10)            # ...before we mark anything
+
+    c = Interleave()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+    g.arm()
+
+    def worker():
+        g.lock_clocks(1400)
+        finally_ran.set()
+
+    w = threading.Thread(target=worker)
+    w.start()
+    assert hw_entered.wait(10)
+    g._restore_impl()                        # signal path, unlocked
+    w.join(15)
+
+    assert c.locked == (1400, 1400), "precondition: the write landed"
+    assert g._restored is False, "guard disarmed while the GPU is modified"
+    assert record(sp)["restored"] is False, "disk reports clean, GPU is locked"
+    assert check_stale_state(FakeGpuController(), sp)["stale"] is True
+
+
+def test_write_depth_is_actually_read(tmp_path):
+    """V2: the counter was incremented and decremented but never consulted."""
+    import inspect
+    from joule_agent import gpu_guard as gg
+
+    src = inspect.getsource(gg.GpuGuard._restore_impl)
+    assert "_write_depth" in src, "_restore_impl ignores the in-flight counter"
+    assert "_write_gen" in src, "_restore_impl ignores the write generation"
+
+
+def test_signal_path_does_not_block_behind_a_held_lock(tmp_path, monkeypatch):
+    """N4: restore() re-acquiring the same RLock made the bounded acquire moot.
+
+    os.kill is stubbed because _signal_restore re-raises the signal on the way
+    out, which would terminate the test runner itself.
+    """
+    import joule_agent.gpu_guard as gg
+
+    monkeypatch.setattr(gg.os, "kill", lambda pid, sig: None)
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
+    g.arm()
+    g.lock_clocks(1400)
+
+    holder_in = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with g._lock:
+            holder_in.set()
+            release.wait(30)
+
+    th = threading.Thread(target=holder)
+    th.start()
+    assert holder_in.wait(10)
+    try:
+        t0 = time.monotonic()
+        g._signal_restore(signal.SIGTERM, None)
+        elapsed = time.monotonic() - t0
+    finally:
+        release.set()
+        th.join(10)
+
+    # Bounded acquire is 2s; blocking on restore() would run to the 30s holder.
+    assert elapsed < 10, f"signal handler blocked {elapsed:.1f}s behind the lock"
+    assert c.locked is None, "restore did not run"
+
+
+def test_recovery_writes_state_file_atomically(tmp_path):
+    """N7: recovery used plain write_text -- a crash mid-write truncates the
+    only evidence, which _read_doc then reports as 'no guard ever ran'."""
+    import joule_agent.gpu_guard as gg
+
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({
+        "schema": 2,
+        "guards": {"999999": {"pid": 999999, "restored": False,
+                              "clocks_locked": True, "snapshot": {}}},
+    }))
+    seen = []
+    real = gg.os.replace
+    gg.os.replace = lambda a, b: (seen.append((str(a), str(b))), real(a, b))[1]
+    try:
+        restore_from_state_file(FakeGpuController(), sp)
+    finally:
+        gg.os.replace = real
+    assert seen, "recovery published the state file without an atomic rename"
+    assert seen[-1][1] == str(sp)
+
+
+def test_state_tmp_name_is_unique_per_thread(tmp_path):
+    """V4: keying the tmp name on pid alone lets two threads collide."""
+    import joule_agent.gpu_guard as gg
+
+    names = []
+    real_open = open
+
+    def spy_open(path, *a, **kw):
+        if str(path).endswith(".tmp"):
+            names.append(str(path))
+        return real_open(path, *a, **kw)
+
+    sp = tmp_path / "state.json"
+    monkey = gg.__dict__
+    monkey["open"] = spy_open
+    try:
+        def w(tag):
+            c = FakeGpuController()
+            g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+            g.arm()
+            g.state.pid = tag
+            g._mark_touched()
+
+        ths = [threading.Thread(target=w, args=(3000 + i,)) for i in range(4)]
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join(20)
+    finally:
+        monkey.pop("open", None)
+
+    assert len(names) == len(set(names)), f"tmp name collision across threads: {names}"
+
+
+def test_main_does_not_close_nvml_while_state_is_unrestored(tmp_path):
+    """N6: closing in `finally` before atexit turns a possible last-chance
+    restore into a guaranteed failure against a dead NVML handle."""
+    import joule_agent.gpu_guard as gg
+    import inspect
+
+    src = inspect.getsource(gg.main)
+    assert "_active_guard" in src
+    assert "c.close()" in src
+    # the close must be conditional, not unconditional in `finally`
+    assert "else:\n            c.close()" in src, "close is unconditional again"
+
+
+def test_nvml_controller_claim_is_exclusive():
+    """The exclusive-claim test previously covered only the fake."""
+    from joule_agent.gpu_guard import NvmlGpuController
+
+    c = object.__new__(NvmlGpuController)
+    c._claimed_by = None
+    c._closed = False
+    c.claim("owner-a")
+    c.claim("owner-a")                      # same owner is fine
+    with pytest.raises(GpuGuardError, match="already claimed"):
+        c.claim("owner-b")

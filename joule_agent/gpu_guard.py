@@ -180,7 +180,7 @@ class NvmlGpuController:
         mistake (constructing a controller and calling it directly) fails
         loudly instead of bypassing the floor, consent and privilege checks.
         """
-        if self._claimed_by is not None and self._claimed_by is not owner:
+        if not _same_owner(self._claimed_by, owner):
             raise GpuGuardError(
                 f"controller already claimed by {self._claimed_by!r}; refusing "
                 "to hand the same device to a second owner"
@@ -277,6 +277,21 @@ class NvmlGpuController:
                 pass
 
 
+def _same_owner(current, owner) -> bool:
+    """True if `owner` may claim a controller `current` already holds.
+
+    Identity first (guards are objects), then equality, because the recovery
+    path claims with a string literal and `is` on strings only works via
+    CPython interning.
+    """
+    if current is None or current is owner:
+        return True
+    try:
+        return bool(current == owner)
+    except Exception:
+        return False
+
+
 def _text(v) -> str:
     return v.decode() if isinstance(v, bytes) else str(v)
 
@@ -303,7 +318,7 @@ class FakeGpuController:
         self.fail_restore = fail_restore
 
     def claim(self, owner) -> None:
-        if self._claimed_by is not None and self._claimed_by is not owner:
+        if not _same_owner(self._claimed_by, owner):
             raise GpuGuardError(
                 f"controller already claimed by {self._claimed_by!r}"
             )
@@ -395,9 +410,75 @@ class GuardState:
 STATE_SCHEMA = 2
 
 
+def _state_lock(path: Path):
+    """Inter-process lock around the state file's read-modify-write.
+
+    Per-pid tmp names stopped one process renaming another's file away, but the
+    document is still read, merged and rewritten wholesale -- two processes can
+    interleave and the later writer silently drops the earlier one's record. A
+    dropped record with restored:false is a GPU whose power cap never gets
+    restored, because recovery only rewrites power when a record says this repo
+    changed it.
+
+    POSIX only. Where flock is unavailable this degrades to a no-op with a
+    warning rather than failing: losing a record is bad, refusing to record
+    intent at all is worse.
+    """
+
+    class _Lock:
+        def __init__(self, p):
+            self.path = p.with_suffix(p.suffix + ".lock")
+            self.fd = None
+
+        def __enter__(self):
+            try:
+                import fcntl
+            except ImportError:  # pragma: no cover - non-POSIX
+                print(
+                    "WARNING [gpu_guard]: fcntl unavailable; state-file writes "
+                    "are unlocked and concurrent guards may lose records.",
+                    file=sys.stderr,
+                )
+                return self
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
+                fcntl.flock(self.fd, fcntl.LOCK_EX)
+            except OSError as exc:  # pragma: no cover - fs dependent
+                print(
+                    f"WARNING [gpu_guard]: could not lock {self.path} ({exc}); "
+                    "proceeding unlocked.",
+                    file=sys.stderr,
+                )
+                if self.fd is not None:
+                    os.close(self.fd)
+                    self.fd = None
+            return self
+
+        def __exit__(self, *exc):
+            if self.fd is not None:
+                try:
+                    import fcntl
+
+                    fcntl.flock(self.fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(self.fd)
+                    self.fd = None
+            return False
+
+    return _Lock(path)
+
+
 def _write_doc_atomic(path: Path, doc: dict) -> None:
+    """Atomically publish `doc`. Caller holds the state lock when merging."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+    # Unique per process AND per thread. Keying on pid alone lets two threads in
+    # one process truncate the same tmp -- the intra-process form of the
+    # cross-process collision that per-pid naming fixed. Deliberately NOT
+    # tempfile.mkstemp: that creates 0600, os.replace preserves the mode, and a
+    # root-written state file would become unreadable by the unprivileged
+    # `gpu_guard status` command that the recovery flow depends on.
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
     with open(tmp, "w") as fh:
         json.dump(doc, fh, indent=2)
         fh.flush()
@@ -411,39 +492,20 @@ def _write_doc_atomic(path: Path, doc: dict) -> None:
             os.close(dfd)
     except OSError:
         pass
-
 
 
 def _write_state_atomic(path: Path, state: GuardState) -> None:
-    """Write + fsync before any hardware write. Survives a hard kill.
+    """Merge this guard's record into the shared document and publish it.
 
-    Records are keyed by pid. A single shared document with one record would
-    let a second guard's clean restore overwrite a first guard's un-restored
-    record, destroying the only evidence that a GPU is still modified.
+    Records are keyed by pid so a second guard's clean restore cannot overwrite
+    a first guard's un-restored record. The whole read-merge-write runs under
+    the inter-process lock.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    doc = _read_doc(path)
-    doc["schema"] = STATE_SCHEMA
-    doc.setdefault("guards", {})[str(state.pid)] = state.to_dict()
-    # Per-process tmp name. A shared ".tmp" lets one process rename another's
-    # in-flight file away, which deletes records outright and raises
-    # FileNotFoundError in os.replace -- strictly worse than the single-record
-    # clobbering this schema replaced.
-    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
-    with open(tmp, "w") as fh:
-        json.dump(doc, fh, indent=2)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-    # fsync the directory so the rename itself is durable.
-    try:
-        dfd = os.open(str(path.parent), os.O_RDONLY)
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except OSError:
-        pass
+    with _state_lock(path):
+        doc = _read_doc(path)
+        doc["schema"] = STATE_SCHEMA
+        doc.setdefault("guards", {})[str(state.pid)] = state.to_dict()
+        _write_doc_atomic(path, doc)
 
 
 def _read_doc(path: Path) -> dict:
@@ -492,6 +554,11 @@ class GpuGuard:
         self._lock = threading.RLock()
         self._depth = 0
         self._write_depth = 0
+        #: Bumped by every _mark_touched(). A restore captures it on entry and
+        #: refuses to record success if it moved, which catches a write that
+        #: both starts and finishes inside the restore window -- a depth check
+        #: alone would see 0 at entry and 0 at exit and miss it.
+        self._write_gen = 0
         self._armed = False
         self._restored = True
         self._prev_handlers: dict = {}
@@ -647,6 +714,7 @@ class GpuGuard:
         assert self.state is not None
         self.state.restored = False
         self._restored = False
+        self._write_gen += 1
         _write_state_atomic(self._state_path, self.state)
 
     def lock_clocks(self, min_mhz: int, max_mhz: int | None = None) -> None:
@@ -666,9 +734,12 @@ class GpuGuard:
             self.state.clocks_locked = True
             self.state.locked_min_mhz = min_mhz
             self.state.locked_max_mhz = max_mhz
-            self._mark_touched()
+            # Raised BEFORE _mark_touched(): an unlocked restore running on
+            # the signal path must see "write in flight" for the whole window,
+            # including the gap between recording intent and issuing the write.
             self._write_depth += 1
             try:
+                self._mark_touched()
                 self._c.set_locked_clocks(min_mhz, max_mhz)
             finally:
                 self._write_depth -= 1
@@ -704,9 +775,12 @@ class GpuGuard:
                 )
             assert self.state is not None
             self.state.power_limit_written_mw = int(milliwatts)
-            self._mark_touched()
+            # Raised BEFORE _mark_touched(): an unlocked restore running on
+            # the signal path must see "write in flight" for the whole window,
+            # including the gap between recording intent and issuing the write.
             self._write_depth += 1
             try:
+                self._mark_touched()
                 self._c.set_power_limit_mw(int(milliwatts))
             finally:
                 self._write_depth -= 1
@@ -737,10 +811,22 @@ class GpuGuard:
         another thread. ``restore()`` re-entering the same RLock would make a
         bounded acquire pointless -- the handler would simply block on the next
         line instead.
+
+        Because this can run unlocked and concurrently with a write on another
+        thread, it must never record success when a write is in flight: the
+        write may apply its setting *after* the reset here and *before* the
+        marking here, leaving the GPU modified while memory and disk both say
+        clean. ``_write_depth`` and ``_write_gen`` are the two guards.
         """
         if True:
             if self._restored:
                 return
+            gen_at_entry = self._write_gen
+            # Captured at ENTRY as well as checked at exit. A write already in
+            # flight when we start will have decremented the depth back to 0 by
+            # the time we finish, and its generation bump happened before we
+            # sampled -- so neither exit-side check alone would see it.
+            depth_at_entry = self._write_depth
             errors = []
             try:
                 self._c.reset_locked_clocks()
@@ -791,6 +877,23 @@ class GpuGuard:
                     + f". State file {self._state_path} retains restored=false; "
                     "run `sudo python -m joule_agent.gpu_guard restore`."
                 )
+
+            if (
+                depth_at_entry > 0
+                or self._write_depth > 0
+                or self._write_gen != gen_at_entry
+            ):
+                # A write overlapped this restore. The hardware reset above may
+                # have been undone by that write landing after it. Leave the
+                # guard armed and the state file dirty; the write's own finally,
+                # __exit__, atexit or an operator `restore` will settle it.
+                if self.state is not None:
+                    self.state.restored = False
+                    try:
+                        _write_state_atomic(self._state_path, self.state)
+                    except Exception:
+                        pass
+                return
 
             self._restored = True
             if self.state is not None:
@@ -1000,7 +1103,11 @@ def restore_from_state_file(
             rec["_recovered_by"] = "restore_from_state_file"
             result["records_cleared"] += 1
         try:
-            _write_doc_atomic(Path(state_path), doc)
+            # Same read-modify-write hazard as _write_state_atomic: `doc` was
+            # read earlier in this function, so a guard writing meanwhile would
+            # be clobbered without the lock.
+            with _state_lock(Path(state_path)):
+                _write_doc_atomic(Path(state_path), doc)
         except Exception as exc:
             result["errors"].append(f"state_file: {exc}")
     return result
@@ -1083,6 +1190,7 @@ def main(argv=None) -> int:
         # NVML down, and the atexit last-chance restore would then fail against a
         # dead handle -- converting a possible recovery into a certain failure.
         held = getattr(main, "_active_guard", None)
+        main._active_guard = None   # never let one run suppress a later close
         if held is not None and not held._restored:
             print(
                 "WARNING [gpu_guard]: leaving NVML open so the exit-time restore "
