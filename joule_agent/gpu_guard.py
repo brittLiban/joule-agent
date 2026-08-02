@@ -30,8 +30,9 @@ Two constraints are enforced rather than defended against:
   what that does NOT buy you: signal dispositions are process-global, so with
   two guards armed only the last to install runs on SIGINT/SIGTERM. The earlier
   one recovers through its state file, the documented hard-kill path, not
-  in-process. See :meth:`GpuGuard._chain_link` for why chaining between guards
-  was removed rather than repaired.
+  in-process. The guard does not chain to any other handler -- see
+  :meth:`GpuGuard._install_handlers` for why that capability was removed
+  rather than repaired.
 
 This is a narrowing, and it was chosen on evidence. Four review passes of an
 earlier design found 27 defects; the large majority lived in machinery added to
@@ -751,7 +752,9 @@ class GpuGuard:
         self._armed = False
         self._restored = True
         self._owner_thread: int | None = None
-        self._prev_handlers: dict = {}
+        #: Signals the process was IGNORING when we armed. A lookup, never a
+        #: call -- see _install_handlers for why there is no handler chain.
+        self._ignored: set = set()
         #: One stable bound method. `self._signal_restore` builds a NEW bound
         #: object on every attribute access, so `signal.getsignal(sig) is
         #: self._signal_restore` is always False and cannot be used to ask "is
@@ -949,10 +952,7 @@ class GpuGuard:
         # resumes and sets _armed True again. The guard is left armed with NO
         # handlers, and because every entry point short-circuits on _armed,
         # nothing ever reinstalls: the next clock lock runs with no in-process
-        # restore path at all. A signal landing inside _install_handlers is
-        # worse still -- the partial uninstall clears _prev_handlers, and the
-        # resuming loop reinstalls over an empty dict, destroying the
-        # application's handler for that signal.
+        # restore path at all.
         #
         # No NVML call is issued in here (the snapshot is already taken), so
         # blocking cannot strand a Ctrl+C behind a hanging driver.
@@ -963,6 +963,32 @@ class GpuGuard:
         return self
 
     def _install_handlers(self) -> None:
+        """Take ownership of SIGINT/SIGTERM for as long as this guard is armed.
+
+        **The guard does not chain to the application's handler, by design.**
+        It used to, and that one decision -- what to record as "previous" --
+        produced three defects across three review passes, each fix correct for
+        the bug it named and wrong for a case one step away:
+
+        * record unconditionally -> a second install stored the guard's *own*
+          handler as previous, and the chain call invoked itself without bound;
+        * record once only -> a handler the application installed between two
+          ``with`` blocks was overwritten and never ran again;
+        * record unless it is mine -> two guards recorded each other, a 2-cycle,
+          unbounded again, because "not mine" excludes only self-loops.
+
+        The capability those were serving -- *the application's handler still
+        runs after the guard restores* -- was never in this module's contract.
+        The contract is that the GPU returns to stock. So the chain is gone:
+        nothing is recorded, nothing is called back, and a cycle is not
+        expressible. **Install your own handler around the guard, not under
+        it.** While a guard is armed these two signals belong to it.
+
+        One property of the previous disposition is still honoured, because it
+        is about whether to kill the process rather than about chaining: a
+        process that deliberately set SIG_IGN is not converted into a death.
+        That needs a lookup, never a call.
+        """
         if not self._atexit_registered:
             atexit.register(self._atexit_restore)
             self._atexit_registered = True
@@ -970,7 +996,14 @@ class GpuGuard:
             try:
                 current = signal.getsignal(sig)
                 if current is not self._handler:
-                    self._prev_handlers[sig] = self._chain_link(sig, current)
+                    # Refresh on every arm: an application may have changed the
+                    # disposition since the last one. Skip when ours is already
+                    # installed, or a re-arm would read our handler back and
+                    # forget that the signal was being ignored.
+                    if current is signal.SIG_IGN:
+                        self._ignored.add(sig)
+                    else:
+                        self._ignored.discard(sig)
                 signal.signal(sig, self._handler)
             except (ValueError, OSError) as exc:  # pragma: no cover
                 self.handler_install_failures.append(str(sig))
@@ -993,81 +1026,7 @@ class GpuGuard:
                 file=sys.stderr,
             )
 
-    @staticmethod
-    def _chain_link(sig, current):
-        """What to record as the previous handler for ``sig``.
-
-        **Never another guard.** Recording the handler that happens to be
-        installed sounds obviously right and is the source of three separate
-        defects:
-
-        * Recording it *unconditionally* meant a second install by the SAME
-          guard stored its own handler as "previous", and the chain call at the
-          end of :meth:`_signal_restore` invoked itself without bound -- NVML
-          resets and fsynced state writes all the way down, and the process
-          survived a SIGTERM it was meant to die from.
-        * Recording it *once only* fixed that but broke the opposite case: the
-          guard disarms on surrender, so an application can install its own
-          handler between two ``with`` blocks, and a once-only record
-          overwrote it and chained to a stale one.
-        * Recording it *unless it is mine* fixed that and reintroduced the
-          first, one object over: two guards that record each other are a
-          2-cycle, and "not mine" only ever excluded self-loops.
-
-        So take the guard's own link instead of the guard. That link is
-        inductively never a guard, so one lookup suffices -- no walk, no hop
-        limit, and a cycle cannot be represented rather than being detected.
-
-        **The trade, stated plainly.** With two guards armed in one process,
-        only the last to install runs on a signal; the earlier one no longer
-        restores in-process. Its state file still records ``restored: false``
-        with whatever it locked, so it recovers through the documented hard-kill
-        path, and ``_check_not_busy`` refuses the next arm until that runs. That
-        is a real degradation from chaining -- but it degrades to the crash path
-        this module is built around, instead of to an unbounded recursion that
-        leaves the process alive. Nothing in this repo arms two guards at once.
-        """
-        owner = getattr(current, "__self__", None)
-        if isinstance(owner, GpuGuard):
-            inherited = owner._prev_handlers.get(sig)
-            return signal.SIG_DFL if inherited is None else inherited
-        return current
-
-    def _uninstall_handlers(self) -> None:
-        """Leave the handler chain. Called wherever the guard disarms.
-
-        Leaving our handler installed after disarming is what makes the chain
-        cyclic: the NEXT guard to arm reads it back as its own "previous", and
-        once two guards have recorded each other, _signal_restore's chain call
-        invokes the other, which invokes back, unbounded -- the pass-7 failure
-        in a two-object shape. "Not mine" only ever excluded self-loops.
-
-        Restore the previous handler only if OURS is the one currently
-        installed. A guard that armed after us may have installed over the top,
-        and clobbering it would delete its restore path.
-        """
-        for sig, prev in list(self._prev_handlers.items()):
-            try:
-                if prev is None:
-                    # getsignal returns None for a handler installed from C.
-                    # signal.signal(sig, None) raises TypeError, which would
-                    # leave OUR handler installed over a cleared dict. Leaving
-                    # it installed is the same outcome, minus the exception --
-                    # but say so rather than arriving there by accident.
-                    continue
-                if signal.getsignal(sig) is self._handler:
-                    signal.signal(sig, prev)
-            except (ValueError, OSError, TypeError):  # pragma: no cover
-                pass
-        self._prev_handlers.clear()
-
     def _signal_restore(self, signum, frame) -> None:
-        # Read the chain link BEFORE restoring: restore() disarms, and
-        # disarming clears _prev_handlers. Reading afterwards would find None
-        # and kill the process by default action, skipping the application's
-        # own handler entirely.
-        prev = self._prev_handlers.get(signum)
-
         # Hardware writes run with these signals blocked, so this handler can
         # never observe a half-applied write. No in-flight bookkeeping needed.
         try:
@@ -1078,30 +1037,21 @@ class GpuGuard:
                 file=sys.stderr,
             )
 
-        # Step aside ONLY if the restore actually succeeded. On the failure
-        # path restore() raised, so _uninstall_handlers never ran: the guard is
-        # still armed, the record still says restore_failed, and the GPU is
-        # still modified. Handing this signal back unconditionally meant a
-        # second SIGTERM made no restore attempt at all -- the in-process retry
-        # was removed exactly when the device was known to be modified. Keep
-        # our handler installed and still chain below, so the process dies the
-        # way the sender intended if that is what the previous handler does.
-        if self._restored:
-            try:
-                signal.signal(
-                    signum, prev if prev is not None else signal.SIG_DFL
-                )
-            except Exception:
-                pass
-        if prev is signal.SIG_IGN:
+        if signum in self._ignored:
             # The process deliberately ignored this signal before we armed.
-            # Restoring the GPU is ours to do; killing the process is not.
+            # Restoring the GPU is ours to do; killing the process is not. Our
+            # handler stays installed, so if the restore just failed, a second
+            # delivery retries it -- the only case where a second delivery can
+            # happen at all, since every other path terminates below.
             return
-        if callable(prev) and prev not in (signal.SIG_DFL, signal.SIG_IGN):
-            prev(signum, frame)
-        else:
-            # Re-raise so the process still dies the way the sender intended.
-            os.kill(os.getpid(), signum)
+
+        # Die the way the sender intended. Deliberately not "call whatever was
+        # there before": see _install_handlers.
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except Exception:  # pragma: no cover
+            pass
+        os.kill(os.getpid(), signum)
 
     # -- writes ----------------------------------------------------------
 
@@ -1206,7 +1156,6 @@ class GpuGuard:
                     # that re-arms over its own unreleased record is refused.
                     return
             self._armed = False
-            self._uninstall_handlers()
 
     def restore(self) -> None:
         """Return the GPU to stock. Idempotent; safe to call any number of times.
@@ -1300,7 +1249,6 @@ class GpuGuard:
             # _check_not_busy, and leave the handler chain. See
             # _surrender_claim.
             self._armed = False
-            self._uninstall_handlers()
 
     # -- context manager -------------------------------------------------
 

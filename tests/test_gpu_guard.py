@@ -1560,65 +1560,6 @@ def test_a_failed_state_write_leaves_no_debris_and_no_lost_record(tmp_path):
     assert leftovers == [], f"temp files left behind: {leftovers}"
 
 
-def test_installing_handlers_twice_does_not_chain_the_guard_to_itself(tmp_path):
-    """The second install must not record the first install's own handler.
-
-    signal.getsignal() returns whatever is currently installed. On a second
-    pass that is self._signal_restore, so _prev_handlers[sig] becomes the
-    guard's own handler -- and _signal_restore's chain-to-previous call at the
-    end then calls itself, unbounded, re-issuing NVML restores all the way
-    down. The process survives a SIGTERM it was meant to die from, and the
-    application's real handler is lost for good.
-    """
-    original = signal.getsignal(signal.SIGINT)
-    g = guard(tmp_path)
-    try:
-        g._install_handlers()
-        g._install_handlers()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            # NOT `is not g._signal_restore` -- that builds a fresh bound method
-            # on every access, so the comparison is unconditionally true and
-            # passes under the very bug it claims to catch. Compare the
-            # underlying function.
-            rec = g._prev_handlers[sig]
-            assert getattr(rec, "__func__", None) is not GpuGuard._signal_restore, (
-                f"{sig!r}: the guard chained itself to a guard's own handler"
-            )
-        assert g._prev_handlers[signal.SIGINT] is original
-    finally:
-        for sig, prev in g._prev_handlers.items():
-            signal.signal(sig, prev)
-
-
-def test_the_previous_handler_runs_exactly_once_after_a_reused_guard(tmp_path):
-    """The same defect, end to end, in a real process taking a real signal."""
-    script = textwrap.dedent(f"""
-        import signal, sys
-        sys.path.insert(0, {str(Path.cwd())!r})
-        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
-
-        calls = []
-        signal.signal(signal.SIGTERM, lambda s, f: calls.append(s))
-
-        g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
-                     state_path={str(tmp_path / "s.json")!r})
-        with g:
-            pass                      # arms, then surrenders and disarms
-        with g:
-            g.lock_clocks(1400)       # re-arms: handlers installed a second time
-            import os
-            os.kill(os.getpid(), signal.SIGTERM)
-        print("PREV_CALLS", len(calls))
-    """)
-    p = subprocess.run([sys.executable, "-c", script],
-                       capture_output=True, text=True, timeout=60)
-    assert "PREV_CALLS 1" in p.stdout, (
-        f"the application's handler did not run exactly once: "
-        f"{p.stdout!r} {p.stderr[-400:]!r}"
-    )
-    assert "RecursionError" not in p.stderr, "the guard chained into itself"
-
-
 def test_a_surrendered_claim_disarms_so_reuse_rechecks_the_device(tmp_path):
     """Releasing the claim without disarming leaves a guard that can write
     hardware while holding nothing on disk.
@@ -1828,43 +1769,6 @@ def test_a_failed_final_write_leaves_the_retry_alive(tmp_path):
     assert g._armed is False
 
 
-def test_a_handler_installed_between_uses_is_not_lost(tmp_path):
-    """Recording the previous handler ONCE is wrong now that the guard disarms.
-
-    An application can install its own handler between one `with` block and the
-    next. A once-only record overwrites it with _signal_restore and chains to
-    the stale handler from the first arm, so the application's current handler
-    never runs again -- and is unrecoverable.
-    """
-    script = textwrap.dedent(f"""
-        import os, signal, sys
-        sys.path.insert(0, {str(Path.cwd())!r})
-        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
-
-        first, second = [], []
-        signal.signal(signal.SIGTERM, lambda s, f: first.append(s))
-
-        g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
-                     state_path={str(tmp_path / "s.json")!r})
-        with g:
-            pass                          # arms, surrenders, disarms
-
-        # The application changes its mind between uses.
-        signal.signal(signal.SIGTERM, lambda s, f: second.append(s))
-
-        with g:
-            g.lock_clocks(1400)
-            os.kill(os.getpid(), signal.SIGTERM)
-        print("FIRST", len(first), "SECOND", len(second))
-    """)
-    p = subprocess.run([sys.executable, "-c", script],
-                       capture_output=True, text=True, timeout=60)
-    assert "FIRST 0 SECOND 1" in p.stdout, (
-        f"the handler installed between uses was lost: "
-        f"{p.stdout!r} {p.stderr[-400:]!r}"
-    )
-
-
 def test_the_stored_handler_is_one_stable_object(tmp_path):
     """The mechanism the fix depends on, pinned directly.
 
@@ -1882,10 +1786,12 @@ def test_the_stored_handler_is_one_stable_object(tmp_path):
     try:
         g._install_handlers()
         assert signal.getsignal(signal.SIGINT) is g._handler
+        # Idempotent: a second install must not change what is installed.
+        g._install_handlers()
+        assert signal.getsignal(signal.SIGINT) is g._handler
     finally:
-        for sig, prev in g._prev_handlers.items():
-            signal.signal(sig, prev)
-    assert original is signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, original)
+        signal.signal(signal.SIGTERM, signal.getsignal(signal.SIGTERM))
 
 
 def test_a_failed_claim_release_also_leaves_the_retry_alive(tmp_path):
@@ -1990,121 +1896,6 @@ def test_a_moved_card_still_gets_the_plain_gpu_flag(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_two_guards_never_chain_into_a_cycle(tmp_path):
-    """"Not mine" excluded only self-loops, so two guards could record each other.
-
-    Nothing uninstalled on disarm, so a disarmed guard's handler stayed
-    installed and became the `current` the next guard recorded. After
-    a.arm / b.arm / a.restore / a.arm, _prev_handlers is a 2-cycle and
-    _signal_restore's chain call runs a -> b -> a -> ... unbounded: the process
-    survives a SIGTERM it was meant to die from, and if either restore is
-    failing, every level re-issues NVML resets and fsynced state writes.
-    """
-    original = signal.getsignal(signal.SIGINT)
-    a = guard(tmp_path, controller=FakeGpuController())
-    b = GpuGuard(FakeGpuController(), consent=True, require_root=False,
-                 state_path=tmp_path / "b.json")
-    try:
-        a.arm()
-        b.arm()
-        a.restore()
-        a.arm()
-
-        def chain(g, sig, seen=None):
-            seen = seen or []
-            prev = g._prev_handlers.get(sig)
-            owner = getattr(prev, "__self__", None)
-            assert owner not in seen, f"handler cycle: {seen + [owner]}"
-            if isinstance(owner, GpuGuard):
-                chain(owner, sig, seen + [owner])
-
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            chain(a, sig, [a])
-            chain(b, sig, [b])
-    finally:
-        for g in (a, b):
-            for sig, prev in list(g._prev_handlers.items()):
-                signal.signal(sig, prev)
-        signal.signal(signal.SIGINT, original)
-
-
-def test_a_disarmed_guard_puts_the_previous_handler_back(tmp_path):
-    """Disarming must leave the chain, not just stop using it.
-
-    Hermetic on purpose: 25 tests in this file arm a guard and never restore
-    it, so whatever SIGINT points at on entry is often a dead guard's handler
-    -- which _chain_link deliberately refuses to record. Install a known
-    non-guard handler so the assertion is about the guard, not about the
-    residue of the test that ran before it.
-    """
-    before = signal.getsignal(signal.SIGINT)
-    sentinel = lambda signum, frame: None
-    signal.signal(signal.SIGINT, sentinel)
-    try:
-        g = guard(tmp_path)
-        g.arm()
-        assert signal.getsignal(signal.SIGINT) is g._handler
-        g.restore()
-        assert signal.getsignal(signal.SIGINT) is sentinel, (
-            "a disarmed guard left its handler installed for the next to record"
-        )
-        assert g._prev_handlers == {}
-    finally:
-        signal.signal(signal.SIGINT, before)
-
-
-def test_a_disarming_guard_does_not_clobber_a_later_guards_handler(tmp_path):
-    """Only uninstall if OURS is the handler actually installed.
-
-    A guard that armed after us has installed over the top; restoring "our"
-    previous handler would delete its restore path.
-    """
-    before = signal.getsignal(signal.SIGINT)
-    a = guard(tmp_path, controller=FakeGpuController())
-    b = GpuGuard(FakeGpuController(), consent=True, require_root=False,
-                 state_path=tmp_path / "b.json")
-    try:
-        a.arm()
-        b.arm()
-        assert signal.getsignal(signal.SIGINT) is b._handler
-        a.restore()
-        assert signal.getsignal(signal.SIGINT) is b._handler, (
-            "a disarming guard deleted a live guard's restore path"
-        )
-        # And b did not chain to a: _chain_link takes a's link, not a itself.
-        assert getattr(b._prev_handlers[signal.SIGINT], "__self__", None) is not a
-    finally:
-        b.restore()
-        signal.signal(signal.SIGINT, before)
-
-
-def test_the_application_handler_still_runs_when_disarm_clears_the_chain(tmp_path):
-    """_signal_restore must read its chain link BEFORE restoring.
-
-    restore() disarms, and disarming clears _prev_handlers. Reading afterwards
-    finds None and kills the process by default action -- silently skipping the
-    application's own handler.
-    """
-    script = textwrap.dedent(f"""
-        import os, signal, sys
-        sys.path.insert(0, {str(Path.cwd())!r})
-        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
-        calls = []
-        signal.signal(signal.SIGTERM, lambda s, f: calls.append(s))
-        g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
-                     state_path={str(tmp_path / "s.json")!r})
-        with g:
-            g.lock_clocks(1400)
-            os.kill(os.getpid(), signal.SIGTERM)
-        print("APP_CALLS", len(calls))
-    """)
-    p = subprocess.run([sys.executable, "-c", script],
-                       capture_output=True, text=True, timeout=60)
-    assert "APP_CALLS 1" in p.stdout, (
-        f"the application's handler was skipped: {p.stdout!r} {p.stderr[-400:]!r}"
-    )
-
-
 def test_the_surrender_tail_is_not_re_enterable(tmp_path):
     """A signal between the flag and the write disarmed under a frame that was
     about to decide it should stay armed."""
@@ -2136,15 +1927,17 @@ def test_the_surrender_tail_is_not_re_enterable(tmp_path):
 
 
 def test_a_signal_during_arm_cannot_leave_it_armed_without_handlers(tmp_path):
-    """arm() installs handlers, then sets _armed. A signal in between ran
-    _signal_restore -> restore -> _surrender_claim, which UNINSTALLED and set
-    _armed False -- and then the interrupted frame resumed and set _armed True.
-    Armed with no handlers, and every entry point short-circuits on _armed, so
-    nothing ever reinstalled: the next clock lock had no in-process restore
-    path at all.
+    """arm() installs handlers, then sets _armed.
 
-    Needs an application handler that RETURNS (the default SIGINT handler
-    raises KeyboardInterrupt and unwinds arm(), so it never triggers).
+    A signal in that window used to run _signal_restore -> restore ->
+    _surrender_claim, which uninstalled and set _armed False; the interrupted
+    frame then resumed and set _armed True, leaving the guard armed with no
+    handlers and nothing to reinstall them (every entry point short-circuits on
+    _armed). Two independent things now prevent it: install/arm/publish is one
+    signal-blocked step, and disarming no longer uninstalls at all.
+
+    What must be observable: the guard restores and the process dies. It must
+    never come out the other side still running.
     """
     script = textwrap.dedent(f"""
         import os, signal, sys
@@ -2152,105 +1945,41 @@ def test_a_signal_during_arm_cannot_leave_it_armed_without_handlers(tmp_path):
         import joule_agent.gpu_guard as gg
         from joule_agent.gpu_guard import FakeGpuController, GpuGuard
 
-        seen = []
-        signal.signal(signal.SIGTERM, lambda s, f: seen.append(s))  # returns
-
         g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
                      state_path={str(tmp_path / "s.json")!r})
 
         # Fire from inside _install_handlers -- the real window is between
         # installing and `_armed = True`. Firing from _write_state would miss
-        # it, because _write_state blocks these signals itself, so delivery is
-        # deferred until after _armed is already set.
+        # it, because _write_state blocks these signals itself.
         real = gg.GpuGuard._install_handlers
         def spy(self):
             real(self)
             os.kill(os.getpid(), signal.SIGTERM)
         gg.GpuGuard._install_handlers = spy
-        try:
-            g.arm()
-        finally:
-            gg.GpuGuard._install_handlers = real
-
-        armed = g._armed
-        installed = signal.getsignal(signal.SIGTERM) is g._handler
-        print("ARMED", armed, "HANDLER", installed, "DELIVERED", len(seen))
+        g.arm()
+        gg.GpuGuard._install_handlers = real
+        print("ARMED", g._armed, "HANDLER",
+              signal.getsignal(signal.SIGTERM) is g._handler, flush=True)
     """)
     p = subprocess.run([sys.executable, "-c", script],
                        capture_output=True, text=True, timeout=60)
-    out = p.stdout.strip()
-    assert "DELIVERED 1" in out, f"the signal never arrived: {out!r}"
 
-    # The invariant is the conjunction, not either half. Blocking the signal
-    # across install-arm-publish means the handler runs AFTER arm() completes,
-    # so the guard ends up cleanly surrendered (ARMED False, HANDLER False).
-    # What must never happen is armed WITHOUT a handler, because nothing
-    # reinstalls once _armed short-circuits arm().
-    armed = "ARMED True" in out
-    handler = "HANDLER True" in out
-    assert not (armed and not handler), (
-        f"armed with no signal handler installed: {out!r} {p.stderr[-400:]!r}"
-    )
-
-
-def test_a_failed_signal_restore_keeps_its_retry_path(tmp_path):
-    """_signal_restore handed the signal back unconditionally.
-
-    On the failure path restore() raised, so _uninstall_handlers never ran: the
-    guard is still armed, the record says restore_failed, the GPU is still
-    modified. Reinstalling the previous handler anyway meant a second SIGTERM
-    made no restore attempt at all -- the in-process retry removed exactly when
-    the device is known to be modified.
-    """
-    chained = []
-    prev = lambda signum, frame: chained.append(signum)
-    before = signal.getsignal(signal.SIGTERM)
-    signal.signal(signal.SIGTERM, prev)
-    try:
-        # fail_restore only declines to clear `locked`; restore() sees no
-        # error and marks itself done. The failure path needs a RAISE.
-        c = RaisingRestore()
-        g = GpuGuard(c, consent=True, require_root=False,
-                     state_path=tmp_path / "state.json")
-        g.arm()
-        g.lock_clocks(1400)
-        assert g._prev_handlers[signal.SIGTERM] is prev
-
-        g._signal_restore(signal.SIGTERM, None)
-
-        assert g._restored is False, "precondition: the restore really failed"
-        assert chained == [signal.SIGTERM], "the chain call did not happen"
-        assert signal.getsignal(signal.SIGTERM) is g._handler, (
-            "gave the signal away while the GPU was still modified"
+    if "ARMED" in p.stdout:
+        # If the frame did resume, the conjunction is what matters: armed
+        # WITHOUT a handler is the state nothing can recover from.
+        armed = "ARMED True" in p.stdout
+        handler = "HANDLER True" in p.stdout
+        assert not (armed and not handler), (
+            f"armed with no signal handler installed: {p.stdout!r}"
         )
-        assert record(tmp_path / "state.json")["restore_failed"] is True
-
-        # And the retry is live: a second delivery tries again.
-        before_calls = c.reset_calls
-        g._signal_restore(signal.SIGTERM, None)
-        assert c.reset_calls > before_calls, "no second restore attempt"
-    finally:
-        signal.signal(signal.SIGTERM, before)
-
-
-def test_a_successful_signal_restore_does_step_aside(tmp_path):
-    """The other direction: on success the guard must hand the signal back, or
-    a second Ctrl+C would be swallowed forever."""
-    before = signal.getsignal(signal.SIGTERM)
-    sentinel = lambda signum, frame: None
-    signal.signal(signal.SIGTERM, sentinel)
-    try:
-        g = guard(tmp_path)
-        g.arm()
-        g.lock_clocks(1400)
-        g._signal_restore(signal.SIGTERM, None)
-        assert g._restored is True
-        assert signal.getsignal(signal.SIGTERM) is sentinel, (
-            "kept the signal after a clean restore"
+    else:
+        assert p.returncode == -signal.SIGTERM, (
+            f"neither survived nor died from the signal: rc={p.returncode} "
+            f"{p.stdout!r} {p.stderr[-400:]!r}"
         )
-    finally:
-        signal.signal(signal.SIGTERM, before)
-
+        assert record(tmp_path / "s.json")["restored"] is True, (
+            "died without releasing the claim it had just published"
+        )
 
 def test_the_clock_floor_cannot_be_lowered_by_a_constructor_argument(tmp_path):
     """Invariant 3 is a refusal, not a default. min_clock_mhz=0 disabled it."""
@@ -2324,3 +2053,189 @@ def test_the_restore_bookkeeping_tail_is_not_re_enterable(tmp_path):
     assert seen, "restore() wrote no record"
     assert signal.SIGINT in seen[-1], "restore's bookkeeping tail was interruptible"
     assert signal.SIGTERM in seen[-1]
+
+
+# ---------------------------------------------------------------------------
+# The handler chain was REMOVED, not repaired. These pin the narrowed contract.
+# ---------------------------------------------------------------------------
+
+
+def test_the_guard_never_calls_a_previous_handler(tmp_path):
+    """The removed capability, pinned as deliberate.
+
+    Chaining to the application's handler produced three defects across three
+    review passes -- self-recursion, a lost handler, and a two-guard cycle --
+    all from the single question of what to record as "previous". That property
+    was never in this module's contract, so the answer is to not record and not
+    call. A guard that is armed OWNS these two signals; install yours around
+    the guard, not under it.
+    """
+    script = textwrap.dedent(f"""
+        import os, signal, sys
+        sys.path.insert(0, {str(Path.cwd())!r})
+        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
+        called = []
+        signal.signal(signal.SIGTERM, lambda s, f: called.append(s))
+        g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path={str(tmp_path / "s.json")!r})
+        g.arm(); g.lock_clocks(1400)
+        # Report before dying -- the guard re-raises with SIG_DFL.
+        import atexit
+        atexit.register(lambda: print("APP_CALLED", len(called), flush=True))
+        os.kill(os.getpid(), signal.SIGTERM)
+        print("SURVIVED", flush=True)
+    """)
+    p = subprocess.run([sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=60)
+    assert "SURVIVED" not in p.stdout, "the guard did not let the process die"
+    assert p.returncode == -signal.SIGTERM, f"rc={p.returncode} {p.stderr[-300:]!r}"
+    assert "APP_CALLED" not in p.stdout, (
+        "the application handler ran; the chain is back"
+    )
+
+
+def test_a_clean_restore_still_dies_the_way_the_sender_intended(tmp_path):
+    """Restore first, then terminate. Both halves, in one real process."""
+    marker = tmp_path / "restored"
+    script = textwrap.dedent(f"""
+        import os, signal, sys
+        sys.path.insert(0, {str(Path.cwd())!r})
+        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
+        from pathlib import Path
+
+        class Marking(FakeGpuController):
+            def reset_locked_clocks(self):
+                super().reset_locked_clocks()
+                Path({str(marker)!r}).write_text(str(self.locked))
+
+        g = GpuGuard(Marking(), consent=True, require_root=False,
+                     state_path={str(tmp_path / "s.json")!r})
+        g.arm(); g.lock_clocks(1400)
+        os.kill(os.getpid(), signal.SIGTERM)
+        print("SURVIVED", flush=True)
+    """)
+    p = subprocess.run([sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=60)
+    assert marker.exists(), f"restore never ran: {p.stdout!r} {p.stderr[-300:]!r}"
+    assert marker.read_text() == "None", "restore ran but did not clear the lock"
+    assert "SURVIVED" not in p.stdout
+    assert p.returncode == -signal.SIGTERM
+    assert record(tmp_path / "s.json")["restored"] is True
+
+
+def test_an_ignored_signal_still_gets_a_retry_after_a_failed_restore(tmp_path,
+                                                                    monkeypatch):
+    """SIG_IGN is the one path where the process survives the handler.
+
+    Every other path re-raises with SIG_DFL and terminates, so there is no
+    second delivery to retry with. Here there is -- and the guard must keep its
+    handler installed so the retry actually happens.
+    """
+    import joule_agent.gpu_guard as gg
+
+    killed = []
+    monkeypatch.setattr(gg.os, "kill", lambda pid, sig: killed.append(sig))
+
+    c = RaisingRestore()
+    g = GpuGuard(c, consent=True, require_root=False,
+                 state_path=tmp_path / "s.json")
+    prev = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        g.arm()
+        g.lock_clocks(1400)
+        g._signal_restore(signal.SIGTERM, None)
+
+        assert killed == [], "killed a process that ignores SIGTERM"
+        assert g._restored is False, "precondition: the restore really failed"
+        assert record(tmp_path / "s.json")["restore_failed"] is True
+        assert signal.getsignal(signal.SIGTERM) is g._handler, (
+            "gave the signal away while the GPU was still modified"
+        )
+
+        before = c.reset_calls
+        g._signal_restore(signal.SIGTERM, None)
+        assert c.reset_calls > before, "no retry on the second delivery"
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+
+
+def test_re_arming_refreshes_whether_the_signal_was_ignored(tmp_path,
+                                                            monkeypatch):
+    """The disposition is a lookup, and a stale one is still a wrong answer.
+
+    A guard disarms on surrender, so an application can change the disposition
+    between two `with` blocks. Reading our OWN handler back on re-arm must not
+    overwrite what we learned, and a real change must be picked up.
+    """
+    import joule_agent.gpu_guard as gg
+    killed = []
+    monkeypatch.setattr(gg.os, "kill", lambda pid, sig: killed.append(sig))
+
+    prev = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        g = guard(tmp_path)
+        g.arm()
+        assert signal.SIGTERM in g._ignored
+        g.restore()
+
+        # Re-arm while OUR handler is still installed: must not forget.
+        g.arm()
+        assert signal.SIGTERM in g._ignored, "re-arm forgot the SIG_IGN"
+        g.restore()
+
+        # The application stops ignoring it; the next arm must notice.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        g.arm()
+        assert signal.SIGTERM not in g._ignored, "kept a stale SIG_IGN"
+        g._signal_restore(signal.SIGTERM, None)
+        assert killed == [signal.SIGTERM], "did not re-raise once un-ignored"
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+
+
+def test_an_ignored_signal_during_arm_cannot_desync_armed_from_the_record(
+        tmp_path, monkeypatch):
+    """SIG_IGN is the one path where the interrupted arm() frame RESUMES.
+
+    Every other delivery re-raises with SIG_DFL and the process dies, so the
+    frame never comes back. Under SIG_IGN the handler returns: _surrender_claim
+    has already published `restored: true` and set _armed False, and then arm()
+    resumes, sets _armed True and republishes. Without the signal block that
+    leaves a guard that believes it holds the device while the record on disk
+    says nobody does -- and another process is free to arm straight over it.
+    """
+    import joule_agent.gpu_guard as gg
+
+    killed = []
+    monkeypatch.setattr(gg.os, "kill", lambda pid, sig: killed.append(sig))
+    prev = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    real = gg.GpuGuard._install_handlers
+    try:
+        def spy(self):
+            real(self)
+            gg.signal.raise_signal(signal.SIGTERM)
+
+        monkeypatch.setattr(gg.GpuGuard, "_install_handlers", spy)
+        sp = tmp_path / "state.json"
+        g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path=sp)
+        g.arm()
+
+        assert killed == [], "killed a process that ignores SIGTERM"
+
+        # The invariant is that the two AGREE, not which value they take.
+        # Blocked, the pending signal is delivered at the end of arm()'s
+        # critical section, so the guard surrenders cleanly: _armed False and
+        # `restored: true`. Unblocked, the handler runs mid-arm -- surrender
+        # publishes `restored: true` and clears _armed, and then the resuming
+        # frame sets _armed True and republishes that same clean record. The
+        # guard then believes it holds the device while the record says nobody
+        # does, and another process arms straight over it.
+        held = g._armed
+        claimed = record(sp)["restored"] is False
+        assert held == claimed, (
+            f"_armed={held} but the record says the device is "
+            f"{'held' if claimed else 'free'} -- these must never disagree"
+        )
+    finally:
+        signal.signal(signal.SIGTERM, prev)
