@@ -1041,3 +1041,137 @@ def test_unreadable_state_file_is_reported_stale_not_clean(tmp_path):
     assert rep["state_file_unreadable"] is True
     assert rep["stale"] is True
     assert any("UNREADABLE" in f for f in rep["findings"])
+
+
+# ---------------------------------------------------------------------------
+# pass-6: state-file validation and device identity
+# ---------------------------------------------------------------------------
+
+
+def _write_record(path, **over):
+    rec = {"pid": 999999, "restored": False, "clocks_locked": True,
+           "device_index": 0, "locked_min_mhz": 900, "locked_max_mhz": 900,
+           "snapshot": {"power_limit_mw": 150_000,
+                        "power_default_limit_mw": 200_000}}
+    rec.update(over)
+    Path(path).write_text(json.dumps({"schema": 3, "record": rec}))
+    return rec
+
+
+def test_recovery_refuses_a_record_for_another_device(tmp_path):
+    """The severe one. A record for GPU 1 must not be applied to GPU 0.
+
+    On a homogeneous node the other device's power value is inside this one's
+    constraints, so NVML accepts it silently: GPU 0 gets mis-capped, GPU 1's
+    record is cleared, and GPU 1 stays locked with its evidence destroyed.
+    """
+    sp = tmp_path / "state.json"
+    _write_record(sp, device_index=1, power_limit_written_mw=120_000)
+    c0 = FakeGpuController(power_limit_mw=200_000, power_default_limit_mw=200_000)
+
+    res = restore_from_state_file(c0, sp)          # controller is GPU 0
+
+    assert res["reset_clocks"] is True, "the local clock reset must still apply"
+    assert c0.get_power_limit_mw() == 200_000, "another GPU's snapshot was applied"
+    assert res["record_cleared"] is False
+    assert res["incomplete"] is True
+    assert any("names GPU 1" in e for e in res["errors"])
+    assert record(sp)["restored"] is False, "another device's evidence was erased"
+
+
+def test_stale_check_names_the_device_and_the_gpu_flag(tmp_path):
+    """The recommendation used to omit --gpu, walking the operator into the
+    wrong-device write."""
+    sp = tmp_path / "state.json"
+    _write_record(sp, device_index=1)
+    rep = check_stale_state(FakeGpuController(), sp)   # controller is GPU 0
+    assert rep["record_is_for_this_device"] is False
+    assert any("OTHER DEVICE" in f for f in rep["findings"])
+    assert "--gpu 1" in rep["recommendation"]
+
+
+def test_stale_recommendation_carries_gpu_for_this_device_too(tmp_path):
+    sp = tmp_path / "state.json"
+    _write_record(sp, device_index=0)
+    rep = check_stale_state(FakeGpuController(), sp)
+    assert rep["record_is_for_this_device"] is True
+    assert "--gpu 0" in rep["recommendation"]
+
+
+@pytest.mark.parametrize("body", [
+    "{ not json",
+    '["a", "list"]',
+    '{"schema": 4, "records": []}',
+    '{"guards": [1, 2]}',
+    '{"guards": {"1": "not-a-record"}}',
+    '{"record": "not-a-record"}',
+])
+def test_malformed_state_files_are_unreadable_not_crashes(tmp_path, body):
+    """A document that parses but has no shape we recognise is equally
+    unusable -- and must not raise AttributeError out of the read-only
+    `status` command."""
+    sp = tmp_path / "state.json"
+    sp.write_text(body)
+    rep = check_stale_state(FakeGpuController(), sp)   # must not raise
+    assert rep["state_file_unreadable"] is True
+    assert rep["stale"] is True
+    assert any("UNREADABLE" in f for f in rep["findings"])
+
+
+def test_arming_over_an_unreadable_state_file_is_refused(tmp_path):
+    """_read_record's own docstring says callers that care must consult the
+    unreadable state; this is the caller that cares most."""
+    sp = tmp_path / "state.json"
+    sp.write_text('{"schema": 4, "records": []}')
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+    with pytest.raises(GuardBusyError, match="could not be interpreted"):
+        g.arm()
+    assert c.set_clock_calls == 0
+    assert sp.read_text() == '{"schema": 4, "records": []}', "the file was overwritten"
+
+
+def test_unreadable_file_can_be_resolved_by_quarantine(tmp_path):
+    """Previously a permanent wedge: status said stale + 'run restore', and
+    restore exited 0 having changed nothing."""
+    sp = tmp_path / "state.json"
+    sp.write_text("{ corrupt")
+    c = FakeGpuController()
+
+    res = restore_from_state_file(c, sp)
+    assert res["incomplete"] is True and res["errors"], "wedge not reported"
+
+    res2 = restore_from_state_file(c, sp, quarantine_unreadable=True)
+    assert res2["quarantined_to"]
+    assert Path(res2["quarantined_to"]).exists(), "the original was not preserved"
+    assert not sp.exists()
+    assert check_stale_state(c, sp)["stale"] is False, "status still wedged"
+
+
+def test_legacy_multi_record_file_is_not_silently_collapsed(tmp_path):
+    """A schema-2 file with two unrestored records would lose one to the
+    schema-3 rewrite -- possibly one naming a different GPU."""
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({"schema": 2, "guards": {
+        "111": {"pid": 111, "restored": False, "clocks_locked": True,
+                "device_index": 0, "snapshot": {}},
+        "222": {"pid": 222, "restored": False, "clocks_locked": True,
+                "device_index": 1, "snapshot": {}},
+    }}))
+    rep = check_stale_state(FakeGpuController(), sp)
+    assert rep["state_file_unreadable"] is True
+    assert any("destroy evidence" in f for f in rep["findings"])
+    res = restore_from_state_file(FakeGpuController(), sp)
+    assert res["record_cleared"] is False
+    assert json.loads(sp.read_text())["schema"] == 2, "the legacy file was rewritten"
+
+
+def test_failed_restore_then_new_guard_names_the_real_cause(tmp_path):
+    """Refusing is right; the message must not blame a second guard object."""
+    sp = tmp_path / "state.json"
+    _write_record(sp, pid=os.getpid(), restore_failed=True,
+                  restore_errors=["reset_locked_clocks: boom"])
+    g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                 state_path=sp)
+    with pytest.raises(GuardBusyError, match="FAILED its restore"):
+        g.arm()

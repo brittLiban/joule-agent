@@ -476,43 +476,90 @@ def _write_state(path: Path, state: GuardState) -> None:
         pass
 
 
-def _read_record(path: Path) -> dict | None:
-    """Read the record, tolerating the two older on-disk shapes.
+#: Result of reading the state file.
+STATE_ABSENT = "absent"
+STATE_OK = "ok"
+STATE_UNREADABLE = "unreadable"
 
-    A file that exists but cannot be parsed is NOT the same as no file. Both
-    return None here, so callers that care must consult :func:`state_unreadable`
-    -- treating an unreadable file as "nothing ever ran" would be a silent
-    no-op on exactly the evidence this module says is the only evidence.
+
+def _load_state(path: Path | str) -> tuple:
+    """Return ``(record_or_None, status, extra)``. Never raises.
+
+    Three states, kept distinct because "no file" and "a file I cannot make
+    sense of" must not collapse into the same answer -- this module's doctrine
+    is that the file is the only evidence a clock lock ever existed, so an
+    unusable one is a reason to stop, not a reason to proceed.
+
+    "Unreadable" covers more than invalid JSON: a document that parses but has
+    no shape we recognise (wrong keys, a list where a mapping belongs, a future
+    schema) is equally unusable. Validating here rather than at the call sites
+    is what stops an ``AttributeError`` escaping the read-only ``status``
+    command.
     """
-    try:
-        doc = json.loads(Path(path).read_text())
-    except Exception:
-        return None
-    if not isinstance(doc, dict):
-        return None
-    if "record" in doc:                      # schema 3
-        return doc["record"]
-    if "guards" in doc:                      # schema 2: prefer an unrestored one
-        recs = list(doc["guards"].values())
-        for r in recs:
-            if not r.get("restored", True):
-                return r
-        return recs[0] if recs else None
-    if "pid" in doc:                         # schema 1: a bare record
-        return doc
-    return None
-
-
-def state_unreadable(path: Path | str) -> bool:
-    """True if the state file exists but could not be parsed."""
     path = Path(path)
     if not path.exists():
-        return False
+        return None, STATE_ABSENT, {}
     try:
-        json.loads(path.read_text())
-        return False
+        doc = json.loads(path.read_text())
+    except Exception as exc:
+        return None, STATE_UNREADABLE, {"reason": f"invalid JSON: {exc}"}
+    if not isinstance(doc, dict):
+        return None, STATE_UNREADABLE, {"reason": "top level is not an object"}
+
+    def _valid(rec):
+        return isinstance(rec, dict) and "pid" in rec
+
+    if "record" in doc:                                   # schema 3
+        rec = doc["record"]
+        if not _valid(rec):
+            return None, STATE_UNREADABLE, {"reason": "'record' is not a record"}
+        return rec, STATE_OK, {}
+
+    if "guards" in doc:                                   # schema 2 (legacy)
+        guards = doc["guards"]
+        if not isinstance(guards, dict):
+            return None, STATE_UNREADABLE, {"reason": "'guards' is not a mapping"}
+        recs = [r for r in guards.values() if _valid(r)]
+        if len(recs) != len(guards):
+            return None, STATE_UNREADABLE, {"reason": "'guards' holds a non-record"}
+        unrestored = [r for r in recs if not r.get("restored", True)]
+        if len(unrestored) > 1:
+            # The deleted per-pid design could produce this. Collapsing it to
+            # one schema-3 record would destroy the others' evidence, and they
+            # may name different devices.
+            return None, STATE_UNREADABLE, {
+                "reason": (
+                    f"legacy schema-2 file holds {len(unrestored)} unrestored "
+                    "records; collapsing it to a single record would destroy "
+                    "evidence. Resolve by hand."
+                )
+            }
+        if unrestored:
+            return unrestored[0], STATE_OK, {"legacy_schema": 2}
+        return (recs[0] if recs else None), (STATE_OK if recs else STATE_UNREADABLE), (
+            {"legacy_schema": 2} if recs else {"reason": "'guards' is empty"}
+        )
+
+    if _valid(doc):                                       # schema 1 (legacy)
+        return doc, STATE_OK, {"legacy_schema": 1}
+    return None, STATE_UNREADABLE, {"reason": "no recognised schema"}
+
+
+def _read_record(path: Path) -> dict | None:
+    """Convenience wrapper. Callers that must distinguish "absent" from
+    "unreadable" use :func:`_load_state` instead."""
+    rec, _status, _extra = _load_state(path)
+    return rec
+
+
+def _controller_index(controller) -> int | None:
+    idx = getattr(controller, "_index", None)
+    if idx is not None:
+        return idx
+    try:
+        return controller.snapshot().index
     except Exception:
-        return True
+        return None
 
 
 def _pid_alive(pid) -> bool:
@@ -603,16 +650,36 @@ class GpuGuard:
             )
 
     def _check_not_busy(self) -> None:
-        prior = _read_record(self._state_path)
+        prior, status, extra = _load_state(self._state_path)
+        if status == STATE_UNREADABLE:
+            # Arming would overwrite a file we could not interpret. If it held
+            # an unrestored record, that is the only evidence the GPU is still
+            # modified, and this module's whole doctrine is that the file is
+            # the only evidence.
+            raise GuardBusyError(
+                f"Refusing to arm: {self._state_path} exists but could not be "
+                f"interpreted ({extra.get('reason', 'unknown')}). Arming would "
+                "overwrite it. Inspect it, then delete or repair it by hand, or "
+                "run `sudo python -m joule_agent.gpu_guard restore "
+                "--quarantine-unreadable`."
+            )
         if not prior or prior.get("restored", True):
             return
         pid = prior.get("pid")
         if pid == os.getpid():
-            # Same pid, unrestored record, and we are not yet armed: that means
-            # a DIFFERENT GpuGuard object in this process holds the device.
-            # (A guard cannot reach here about itself -- _armed is never reset,
-            # so arm() short-circuits after the first call.) Allowing this let a
-            # second guard snapshot the first one's modified state as "stock".
+            # A guard cannot reach here about itself -- _armed is never reset,
+            # so arm() short-circuits after the first call. So this is either a
+            # SECOND GpuGuard object in this process, or this process's earlier
+            # guard whose restore FAILED. Both must be refused; they need
+            # different diagnoses.
+            if prior.get("restore_failed"):
+                raise GuardBusyError(
+                    f"Refusing to arm: an earlier guard in this process (pid "
+                    f"{pid}) FAILED its restore ({prior.get('restore_errors')}) "
+                    "and the device may still be modified. Run `sudo python -m "
+                    f"joule_agent.gpu_guard restore --gpu {prior.get('device_index', 0)}` "
+                    "before arming again."
+                )
             raise GuardBusyError(
                 f"Refusing to arm: another GpuGuard in this process (pid {pid}) "
                 f"holds an unrestored record in {self._state_path}. One guard "
@@ -897,11 +964,15 @@ def check_stale_state(
     Separates what the device confirms from what only the state file asserts.
     """
     path = Path(state_path)
-    prior = _read_record(path)
+    prior, status, extra = _load_state(path)
+    dev = _controller_index(controller)
     report = {
         "state_file": str(path),
         "state_file_present": path.exists(),
-        "state_file_unreadable": state_unreadable(path),
+        "state_file_unreadable": status == STATE_UNREADABLE,
+        "device_index": dev,
+        "record_device_index": (prior or {}).get("device_index"),
+        "record_is_for_this_device": None,
         "power_readable": False,
         "verified_power_modified": False,
         "asserted_clock_lock": False,
@@ -914,9 +985,9 @@ def check_stale_state(
     if report["state_file_unreadable"]:
         report["stale"] = True
         report["findings"].append(
-            "UNREADABLE (state file): the file exists but could not be parsed, "
-            "so the asserted tier could not run. Treat as possibly-modified "
-            "rather than clean."
+            "UNREADABLE (state file): the file exists but could not be "
+            f"interpreted ({extra.get('reason', 'unknown')}), so the asserted "
+            "tier could not run. Treat as possibly-modified rather than clean."
         )
 
     # Tier 1: verifiable directly from the device.
@@ -941,6 +1012,28 @@ def check_stale_state(
         )
 
     # Tier 2: assertion only -- the device cannot be asked about clock locks.
+    if prior is not None:
+        rec_dev = prior.get("device_index")
+        report["record_is_for_this_device"] = (
+            None if (dev is None or rec_dev is None) else rec_dev == dev
+        )
+    if prior and not prior.get("restored", True) and report["record_is_for_this_device"] is False:
+        # Tier 1 above describes the device this controller holds; this record
+        # describes a different one. Saying "stale" without saying which device
+        # would send an operator to reset the wrong GPU.
+        report["stale"] = True
+        report["findings"].append(
+            f"OTHER DEVICE (state file): the unrestored record names GPU "
+            f"{prior.get('device_index')}, but this report was produced against "
+            f"GPU {dev}. Nothing here is evidence about GPU {dev}'s clock lock. "
+            f"Re-run with --gpu {prior.get('device_index')}."
+        )
+        report["recommendation"] = (
+            "Run `sudo python -m joule_agent.gpu_guard restore --gpu "
+            f"{prior.get('device_index')}` -- recovery must target the device "
+            "the record names."
+        )
+        return report
     if prior and not prior.get("restored", True):
         report["stale"] = True
         pid = prior.get("pid")
@@ -978,10 +1071,15 @@ def check_stale_state(
                 "reset the clock but will refuse to clear a live guard's record."
             )
         else:
+            target = report.get("record_device_index")
+            if target is None:
+                target = dev if dev is not None else 0
             report["recommendation"] = (
-                "Run `sudo python -m joule_agent.gpu_guard restore` to return "
-                "the device to stock. Safe even if nothing is actually locked "
-                "-- the clock reset is a no-op on an unlocked GPU."
+                f"Run `sudo python -m joule_agent.gpu_guard restore --gpu "
+                f"{target}` to return the device to stock. The --gpu flag "
+                "matters: recovery applies the record's snapshot to whatever "
+                "device it is pointed at. Safe even if nothing is actually "
+                "locked -- the clock reset is a no-op on an unlocked GPU."
             )
     return report
 
@@ -991,15 +1089,55 @@ def restore_from_state_file(
     state_path: Path | str = DEFAULT_STATE_PATH,
     *,
     force_power_default: bool = False,
+    quarantine_unreadable: bool = False,
 ) -> dict:
     """Recovery path for after a hard kill. Unconditional and idempotent."""
-    prior = _read_record(Path(state_path))
+    prior, status, extra = _load_state(state_path)
+    dev = _controller_index(controller)
     result = {
         "reset_clocks": False,
         "power_restored_to_mw": None,
         "record_cleared": False,
+        "incomplete": False,
         "errors": [],
     }
+
+    if status == STATE_UNREADABLE:
+        if quarantine_unreadable:
+            stamp = _utcnow().replace(":", "").replace("-", "")
+            dest = Path(state_path).with_suffix(f".corrupt-{stamp}")
+            try:
+                os.replace(Path(state_path), dest)
+                result["quarantined_to"] = str(dest)
+            except Exception as exc:
+                result["errors"].append(f"quarantine: {exc}")
+        else:
+            # Without this, `status` reports stale forever and `restore` exits 0
+            # having changed nothing -- a recommendation that cannot resolve the
+            # condition it recommends for.
+            result["incomplete"] = True
+            result["errors"].append(
+                f"{state_path} exists but could not be interpreted "
+                f"({extra.get('reason', 'unknown')}). The clock reset below "
+                "still applies, but the record cannot be cleared. Inspect the "
+                "file, then re-run with --quarantine-unreadable to move it "
+                "aside so `status` can come clean."
+            )
+
+    # A record for another GPU must not be applied to this one: the snapshot's
+    # power value belongs to that device, and on a homogeneous node NVML will
+    # accept it silently.
+    rec_dev = (prior or {}).get("device_index")
+    wrong_device = prior is not None and dev is not None and rec_dev is not None and rec_dev != dev
+    if wrong_device:
+        result["incomplete"] = True
+        result["record_device_index"] = rec_dev
+        result["errors"].append(
+            f"the record names GPU {rec_dev} but recovery was pointed at GPU "
+            f"{dev}. Refusing to write that device's snapshot here or to clear "
+            f"its record. Re-run with --gpu {rec_dev}."
+        )
+        prior = None      # do not use it for power, do not clear it
 
     claim = getattr(controller, "claim", None)
     if callable(claim):
@@ -1064,6 +1202,9 @@ def restore_from_state_file(
                 "wrote to it); refusing to publish a stale read over it. The "
                 "clock reset above still applied -- re-run recovery."
             )
+            # Says "re-run recovery", so it must not report success: a script
+            # doing `restore && echo ok` would otherwise call this a clean run.
+            result["incomplete"] = True
             return result
 
     if prior is not None and not result["errors"]:
@@ -1109,6 +1250,13 @@ def main(argv=None) -> int:
     sub.add_parser("status", help="report stale state (read-only, no privilege)")
     rs = sub.add_parser("restore", help="return the device to stock (requires root)")
     rs.add_argument(
+        "--quarantine-unreadable",
+        action="store_true",
+        help="if the state file cannot be interpreted, move it aside to a "
+             ".corrupt-<timestamp> file so `status` can come clean; the "
+             "original is preserved for inspection",
+    )
+    rs.add_argument(
         "--force-power-default",
         action="store_true",
         help="also reset the power limit to the device default even when no "
@@ -1138,10 +1286,13 @@ def main(argv=None) -> int:
 
         if args.cmd == "restore":
             res = restore_from_state_file(
-                c, args.state_path, force_power_default=args.force_power_default
+                c,
+                args.state_path,
+                force_power_default=args.force_power_default,
+                quarantine_unreadable=args.quarantine_unreadable,
             )
             print(json.dumps(res, indent=2))
-            return 1 if res["errors"] else 0
+            return 1 if (res["errors"] or res.get("incomplete")) else 0
 
         if args.cmd == "lock":
             guard = GpuGuard(c, consent=args.consent, state_path=args.state_path)
