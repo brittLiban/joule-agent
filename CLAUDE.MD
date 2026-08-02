@@ -135,6 +135,57 @@ that cannot fail proves nothing about the code.
 the test is sound. Confirm separately that each assertion CAN be false, and
 that the mutation used breaks the specific property named.
 
+## Final pass: the contract, and what is accepted around it
+
+The bar for the last pass was not "zero findings" but **the two contract
+properties**: (a) the guard never claims `restored` while the hardware is or may
+still be modified, and (b) it never destroys evidence of another live process's
+claim. Findings were ranked CONTRACT or OTHER; CONTRACT was fixed, OTHER is
+recorded here and accepted.
+
+**One CONTRACT violation, property (b), now fixed.** `_published` says *this arm
+cycle wrote a record at some point*; it does not say *the record on disk is
+still mine*. The gap is reachable on the SIG_IGN path — the only one where the
+handler returns and the interrupted frame **resumes**. A signal landing in the
+unblocked stretch of `lock_clocks` (`_check_owner_thread` calls
+`threading.get_ident()`, a delivery point) runs a full surrender, publishing
+`restored: true` and disarming; another process then claims the device; and the
+resuming frame writes `self.state` wholesale over that new claim and touches
+hardware, having never re-run `_check_not_busy`. The newcomer's power cap
+survives with no record that it exists. `_mark_touched` now refuses when the
+claim has been surrendered, and it is called inside both writers' signal-blocked
+section, so the check and the write it guards are atomic.
+
+Worth naming: this is why the pass-13 audit did not catch it. Tests pinned the
+resumed-frame property for `arm()` and had no analogue for `lock_clocks` /
+`set_power_limit_mw`.
+
+**Accepted, not fixed (OTHER):**
+
+- `main()`'s `lock` path pre-checks consent and the clock floor but not
+  privilege, so an unprivileged `lock` arms and publishes before failing. The
+  residue is a *settled* record; it strands only on a hard kill inside that
+  window.
+- `restored: true` can be published alongside `clocks_locked: true` when a
+  signal lands on the first write. Report-field inaccuracy only — every reader
+  (`_check_not_busy`, `check_stale_state` tier 2, `wrote_power`) keys on
+  `restored`, and recovery's clock reset is unconditional.
+- `restore()`'s *failure* branch writes the state file without the `_published`
+  predicate. Traced unreachable on every path — `_restored = False` is set only
+  by `_mark_touched`, which is reached only after a successful publish — but
+  unreachable-by-tracing, not by construction.
+- Recovery's record write bypasses `_write_state`: no signal block, no unique
+  temp name, no directory fsync, and a residual TOCTOU between its re-read and
+  `os.replace`. No guard is armed in a `restore` process, so an interrupt there
+  leaves temp debris and the original record intact.
+- The `_check_not_busy` → `arm()` publish race remains narrowed, not eliminated;
+  its window spans the `snapshot()` NVML round trip. Documented in the module as
+  something not to build on.
+
+**Property (a) holds independently.** All three writers of `restored: true` are
+gated on a completed hardware restore, and `_mark_touched` always records the
+debt before the write, inside the same blocked section.
+
 ## The CLI seam (where the mocked suite is blind)
 
 `tools/cli_contract_check.py` exercises `python -m joule_agent.gpu_guard` as a

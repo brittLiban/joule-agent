@@ -2619,3 +2619,75 @@ def test_an_unopenable_device_names_how_to_find_the_right_index(tmp_path, capsys
     assert "nvidia-smi" in err, "the message does not say how to find a valid index"
     assert "no device was touched" in err
     assert "Traceback" not in err
+
+
+def test_a_surrendered_guard_cannot_republish_over_a_new_claim(tmp_path,
+                                                                monkeypatch):
+    """The one contract violation the final pass found.
+
+    `_published` says this arm cycle wrote a record at some point; it does not
+    say the record on disk is still ours. On the SIG_IGN path the handler
+    returns and the interrupted frame RESUMES, so a signal in the unblocked
+    stretch of lock_clocks (_check_owner_thread calls threading.get_ident, a
+    delivery point) runs a full surrender -- publishing `restored: true` and
+    disarming -- after which another process claims the device. The resuming
+    frame then wrote self.state wholesale over that claim and touched hardware,
+    having never re-run _check_not_busy. The new claim's record is gone, and it
+    named a power cap that is still applied.
+    """
+    import joule_agent.gpu_guard as gg
+
+    killed = []
+    monkeypatch.setattr(gg.os, "kill", lambda pid, sig: killed.append(sig))
+    prev = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        sp = tmp_path / "state.json"
+        a = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path=sp)
+        a.arm()
+        assert record(sp)["restored"] is False
+
+        newcomer = {}
+        real = threading.get_ident
+        fired = []
+
+        def once():
+            # Fires inside _check_owner_thread's get_ident(), i.e. after
+            # lock_clocks' _armed gate and before its signal-blocked section.
+            if not fired and a._armed and a.state is not None \
+                    and a.state.restored is False:
+                fired.append(1)
+                gg.signal.raise_signal(signal.SIGTERM)
+                # The surrender has now published `restored: true`. Another
+                # process takes the device in exactly that gap.
+                b = GpuGuard(FakeGpuController(), consent=True,
+                             require_root=False, state_path=sp)
+                b.arm()
+                b.set_power_limit_mw(150_000)
+                newcomer["guard"] = b
+            return real()
+
+        monkeypatch.setattr(gg.threading, "get_ident", once)
+        try:
+            with pytest.raises(GuardBusyError):
+                a.lock_clocks(1400)
+        finally:
+            monkeypatch.setattr(gg.threading, "get_ident", real)
+
+        assert fired, "the signal never landed in the target window"
+        assert killed == [], "killed a process that ignores SIGTERM"
+        b = newcomer["guard"]
+
+        rec = record(sp)
+        assert rec["pid"] == os.getpid()
+        assert rec["power_limit_written_mw"] == 150_000, (
+            "the surrendered guard republished over the new claim -- the cap "
+            "it applied now has no record that it exists"
+        )
+        assert rec["restored"] is False, "the new claim was marked settled"
+        assert a._c.set_clock_calls == 0, (
+            "wrote hardware while holding no claim"
+        )
+        b.restore()
+    finally:
+        signal.signal(signal.SIGTERM, prev)

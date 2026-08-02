@@ -1122,8 +1122,31 @@ class GpuGuard:
     # -- writes ----------------------------------------------------------
 
     def _mark_touched(self) -> None:
-        """Record intent to disk BEFORE touching hardware."""
+        """Record intent to disk BEFORE touching hardware.
+
+        Refuses if the claim has been surrendered. ``_published`` says *this
+        arm cycle wrote a record at some point*; it does not say *the record on
+        disk is still mine*. The gap is reachable: on the SIG_IGN path the
+        handler returns and the interrupted frame RESUMES, so a signal landing
+        in the unblocked stretch of ``lock_clocks`` (``_check_owner_thread``
+        calls ``threading.get_ident()``, a delivery point) runs a full
+        surrender -- publishing ``restored: true`` and disarming -- after which
+        another process is free to claim the device. The resuming frame would
+        then write ``self.state`` wholesale over that new claim and touch
+        hardware, having never re-run ``_check_not_busy``.
+
+        Called from inside both writers' ``_deferred_signals`` block, so this
+        check and the write it guards are atomic against a signal.
+        """
         assert self.state is not None
+        if not self._armed:
+            raise GuardBusyError(
+                "Refusing to write: this guard no longer holds its claim. A "
+                "signal restored it mid-call, and another process may have "
+                "taken the device since. Writing now would overwrite that "
+                "claim's record and cap a card this guard does not own. "
+                "Re-arm (which re-runs the busy check) before writing again."
+            )
         self.state.restored = False
         self._restored = False
         _write_state(self._state_path, self.state)
