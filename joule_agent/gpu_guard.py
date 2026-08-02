@@ -16,9 +16,17 @@ Two constraints are enforced rather than defended against:
 * **One thread.** The guard must be armed on the main thread, and only that
   thread may write. A worker thread calling :meth:`GpuGuard.lock_clocks` is
   refused.
-* **One instance per machine.** Arming is refused while any unrestored record
-  exists in the state file -- whether the process that wrote it is alive
-  (another guard is running) or dead (a previous run needs recovery first).
+* **One instance per state file.** Arming is refused while any unrestored
+  record exists in it -- whether the process that wrote it is alive (another
+  guard is running) or dead (a previous run needs recovery first). The claim is
+  published by :meth:`GpuGuard.arm`, before the first hardware write, so the
+  gap between the check and the claim is the duration of one snapshot rather
+  than of a whole run. It is **narrowed, not eliminated**: two processes can
+  still both pass the check and both publish, and the later record replaces the
+  earlier wholesale. Do not build on this as a guarantee. Closing it properly
+  needs an inter-process lock, and the paragraph below is the reason there
+  isn't one. To guard several devices at once, give each its own state file --
+  one file holds one record, and arming would overwrite another card's.
 
 This is a narrowing, and it was chosen on evidence. Four review passes of an
 earlier design found 27 defects; the large majority lived in machinery added to
@@ -71,6 +79,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -457,27 +466,49 @@ class GuardState:
 def _write_state(path: Path, state: GuardState) -> None:
     """Publish the record atomically, fsynced, before any hardware write.
 
-    No inter-process locking and no merging: arming is refused while any
-    unrestored record exists, so two guards never write concurrently by
-    construction. Operator-initiated recovery is the only other writer and is a
-    deliberate act.
+    No inter-process locking and no merging. Arming is refused while an
+    unrestored record exists, which narrows concurrent writers to a millisecond
+    window between ``_check_not_busy``'s read and ``arm``'s publish -- it does
+    not eliminate them, so this is a narrowed race, not a guarantee by
+    construction. Do not build on it as one. Operator-initiated recovery is the
+    only other writer and is a deliberate act.
+
+    Runs with the handled signals blocked. Without that, a handler delivered
+    mid-write re-enters here from ``_signal_restore`` -> ``restore``: the inner
+    call publishes the newer truth, and the interrupted outer frame then
+    resumes and replaces it with its own stale content. The worst instance is
+    ``restore``'s failure branch, where the record being overwritten is the
+    only evidence that a still-modified GPU exists. The unique temp name is
+    defence in depth for the same reason -- a shared one lets the two calls
+    collide on a single inode.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    doc = {"schema": STATE_SCHEMA, "record": state.to_dict()}
-    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
-    with open(tmp, "w") as fh:
-        json.dump(doc, fh, indent=2)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-    try:
-        dfd = os.open(str(path.parent), os.O_RDONLY)
+    with _deferred_signals():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        doc = {"schema": STATE_SCHEMA, "record": state.to_dict()}
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
+        )
+        tmp = Path(tmp_name)
         try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
-    except OSError:
-        pass
+            with os.fdopen(fd, "w") as fh:
+                json.dump(doc, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
+        try:
+            dfd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
 
 
 #: Result of reading the state file.
@@ -737,7 +768,15 @@ class GpuGuard:
             )
         if not prior or prior.get("restored", True):
             return
+        # NOT gated on device identity, deliberately. A record naming another
+        # card is still the only record this state file can hold, and arm()
+        # publishes a whole document with no merge -- so proceeding would
+        # overwrite that card's evidence. One state file, one device: refuse,
+        # and name the recovery that resolves it. (Give each device its own
+        # --state-path to run guards on several cards at once.)
         pid = prior.get("pid")
+        rec_gpu = prior.get("device_index")
+        gpu_flag = f" --gpu {rec_gpu}" if rec_gpu is not None else ""
         if pid == os.getpid():
             # A guard cannot reach here about itself -- _armed is never reset,
             # so arm() short-circuits after the first call. So this is either a
@@ -756,25 +795,45 @@ class GpuGuard:
                 f"Refusing to arm: another GpuGuard in this process (pid {pid}) "
                 f"holds an unrestored record in {self._state_path}. One guard "
                 "per device -- a second would capture the first's modified "
-                "settings as if they were stock, and restore to them."
+                "settings as if they were stock, and restore to them. Give the "
+                "second guard its own --state-path if it is for another device."
             )
         if _pid_alive(pid):
             raise GuardBusyError(
                 f"Refusing to arm: pid {pid} is running and holds an unrestored "
                 f"guard record in {self._state_path}. Only one guard may hold "
-                "the device at a time."
+                "the device at a time. Stop that process (its own restore runs "
+                "on exit), or give this guard its own --state-path if it is for "
+                "another device."
             )
+        # A record can be unrestored and still name no hardware change: arm()
+        # publishes the claim before the first write, so a guard killed in that
+        # window leaves exactly this shape. Saying "the GPU may still be
+        # modified" about a record that states the opposite would be a false
+        # statement in the one place an operator is deciding what to trust.
+        wrote_anything = bool(
+            prior.get("clocks_locked")
+            or prior.get("power_limit_written_mw") is not None
+        )
         raise GuardBusyError(
             f"Refusing to arm: pid {pid} died without restoring, and its record "
-            f"in {self._state_path} says the GPU may still be modified"
+            f"in {self._state_path} "
             + (
-                f" (clock lock at [{prior.get('locked_min_mhz')}, "
-                f"{prior.get('locked_max_mhz')}] MHz)."
-                if prior.get("clocks_locked")
-                else "."
+                "says the GPU may still be modified"
+                + (
+                    f" (clock lock at [{prior.get('locked_min_mhz')}, "
+                    f"{prior.get('locked_max_mhz')}] MHz)."
+                    if prior.get("clocks_locked")
+                    else "."
+                )
+                if wrote_anything
+                else "is still outstanding. It records no clock lock and no "
+                "power write, so the device is very likely untouched -- but "
+                "the record is the only evidence there is, and clearing it is "
+                "an operator's decision, not this module's."
             )
-            + " Run `sudo python -m joule_agent.gpu_guard restore` first. "
-            "Arming would overwrite the only evidence that exists."
+            + f" Run `sudo python -m joule_agent.gpu_guard restore{gpu_flag}` "
+            "first. Arming would overwrite the only evidence that exists."
         )
 
     # -- lifecycle -------------------------------------------------------
@@ -821,8 +880,14 @@ class GpuGuard:
         # power_limit_written_mw fields carry the second, and recovery reads
         # them, so nothing downstream is misled.  self._restored stays True
         # because there is no hardware debt yet -- see restore().
-        _write_state(self._state_path, self.state)
+        #
+        # _armed is set BEFORE the publish. _write_state can raise (unwritable
+        # cwd, ENOSPC), and handlers are already installed by this point; a
+        # guard left with handlers installed and _armed False would re-enter
+        # _install_handlers on the next call. That is survivable now only
+        # because the handler recording is idempotent -- keep it that way.
         self._armed = True
+        _write_state(self._state_path, self.state)
         return self
 
     def _install_handlers(self) -> None:
@@ -831,7 +896,16 @@ class GpuGuard:
             self._atexit_registered = True
         for sig in _DEFERRED:
             try:
-                self._prev_handlers[sig] = signal.getsignal(sig)
+                if sig not in self._prev_handlers:
+                    # Record the PREVIOUS handler exactly once. A second install
+                    # would read back self._signal_restore -- installed by the
+                    # first -- and store it as "what was here before", after
+                    # which _signal_restore's chain-to-previous call at the end
+                    # would call itself until the stack blew, re-issuing NVML
+                    # restores all the way down and leaving the process alive on
+                    # a SIGTERM it was supposed to die from. The application's
+                    # own handler would also be lost for good.
+                    self._prev_handlers[sig] = signal.getsignal(sig)
                 signal.signal(sig, self._signal_restore)
             except (ValueError, OSError) as exc:  # pragma: no cover
                 self.handler_install_failures.append(str(sig))
@@ -891,10 +965,15 @@ class GpuGuard:
 
     def lock_clocks(self, min_mhz: int, max_mhz: int | None = None) -> None:
         max_mhz = min_mhz if max_mhz is None else max_mhz
+        # Consent is checked BEFORE auto-arming. arm() now publishes a claim, so
+        # checking after it would leave a record on disk for a caller that was
+        # never allowed to touch the device -- and a kill in that window strands
+        # an operator-visible stale record produced by a guard with neither
+        # consent nor a write.
+        self._check_consent()
         if not self._armed:
             self.arm()
         self._check_owner_thread("lock clocks")
-        self._check_consent()
         # Argument validation BEFORE the environment check: a bad clock value is
         # the caller's bug and is free to detect, so report it even when
         # unprivileged. Checking root first would send an operator to sudo and
@@ -911,10 +990,10 @@ class GpuGuard:
             self._c.set_locked_clocks(min_mhz, max_mhz)
 
     def set_power_limit_mw(self, milliwatts: int) -> None:
+        self._check_consent()           # before arm(); see lock_clocks
         if not self._armed:
             self.arm()
         self._check_owner_thread("set the power limit")
-        self._check_consent()
         snap = self.snapshot
         if snap and snap.power_min_mw is not None and milliwatts < snap.power_min_mw:
             raise GpuGuardError(
@@ -936,16 +1015,29 @@ class GpuGuard:
 
     # -- restore ---------------------------------------------------------
 
-    def _clear_unwritten_claim(self) -> None:
-        """Release the arm-time claim of a guard that never touched hardware."""
-        if self.state is None or self.state.restored:
-            return
-        self.state.restored = True
-        self.state.restored_utc = _utcnow()
-        try:
-            _write_state(self._state_path, self.state)
-        except Exception:
-            pass
+    def _surrender_claim(self) -> None:
+        """Release the published claim and disarm, so reuse re-checks the device.
+
+        Surrendering the claim without disarming would leave the guard object
+        able to write hardware while holding nothing on disk: ``_armed`` short-
+        circuits ``arm()``, so ``with g: pass`` followed by ``with g:
+        g.lock_clocks(1400)`` would reach the device having never re-run
+        ``_check_not_busy`` -- and in between, another process is free to arm
+        over the released claim. Disarming forces the next use to re-snapshot
+        and re-check. Safe only because ``_install_handlers`` records the
+        previous handler once.
+        """
+        if self.state is not None and not self.state.restored:
+            self.state.restored = True
+            self.state.restored_utc = _utcnow()
+            try:
+                _write_state(self._state_path, self.state)
+            except Exception:
+                # Do NOT disarm: the claim may still be on disk, and a guard
+                # that re-arms over its own unreleased record would be refused
+                # anyway. Staying armed keeps the remaining restore paths live.
+                return
+        self._armed = False
 
     def restore(self) -> None:
         """Return the GPU to stock. Idempotent; safe to call any number of times.
@@ -966,7 +1058,7 @@ class GpuGuard:
             # disk would make the next arm refuse over a guard that has finished.
             # Clearing it must NOT reset clocks: a guard that never wrote must
             # not touch the device on the way out.
-            self._clear_unwritten_claim()
+            self._surrender_claim()
             return
         errors = []
         try:
@@ -1022,7 +1114,12 @@ class GpuGuard:
             try:
                 _write_state(self._state_path, self.state)
             except Exception:
-                pass
+                # The claim may still be on disk; stay armed. See
+                # _surrender_claim for why disarming here would be wrong.
+                return
+        # Disarm so a reused guard object re-snapshots and re-runs
+        # _check_not_busy. See _surrender_claim.
+        self._armed = False
 
     # -- context manager -------------------------------------------------
 
@@ -1124,6 +1221,28 @@ def check_stale_state(
         # describes a different one. Saying "stale" without saying which device
         # would send an operator to reset the wrong GPU.
         report["stale"] = True
+        report["identity_unverifiable"] = _identity_unverifiable(mismatch)
+        if report["identity_unverifiable"]:
+            # "Cannot tell" is not "other card". Naming --gpu N here would
+            # prescribe the one thing the code just said proves nothing, and
+            # re-running against that index re-enters the same refusal -- a
+            # loop that never terminates.
+            report["findings"].append(
+                f"UNVERIFIABLE (state file): {mismatch}. This record may or may "
+                f"not be about GPU {dev}; nothing available can decide it, so "
+                "recovery will refuse to apply its snapshot or clear it."
+            )
+            report["recommendation"] = (
+                "Restore the UUID read first -- a driver reload usually does it "
+                "-- then re-run this check. To lift a cap meanwhile, `sudo "
+                f"python -m joule_agent.gpu_guard restore --gpu {dev} "
+                "--force-power-default` resets THIS card to its own default "
+                "without applying anyone's snapshot, and leaves the record "
+                "intact. The record itself stays until identity can be "
+                "confirmed: clearing evidence you cannot attribute is the one "
+                "thing this module will not do for you."
+            )
+            return report
         report["findings"].append(
             f"OTHER DEVICE (state file): {mismatch}. Nothing here is evidence "
             f"about GPU {dev}'s clock lock, and recovery pointed at this device "
@@ -1279,8 +1398,24 @@ def restore_from_state_file(
         target = snap.get("power_limit_mw")
         if target is None:
             target = snap.get("power_default_limit_mw")
+    forced = False
     if target is None and force_power_default:
         target = controller.get_power_default_limit_mw()
+        forced = target is not None
+        if target is None:
+            # get_power_default_limit_mw is _try-wrapped and swallows every NVML
+            # error, so "no default" arrives as None. Reporting the flag here
+            # anyway told an operator who explicitly asked for a hardware change
+            # that it happened, with an empty error list and exit 0 -- and this
+            # is the one lever left when identity cannot be verified, so the
+            # false success lands exactly where it costs most.
+            result["incomplete"] = True
+            result["errors"].append(
+                "--force-power-default was requested but the device default "
+                "power limit could not be read, so NOTHING was written. Any cap "
+                "in effect is still in effect."
+            )
+    if forced:
         result["power_forced_to_default"] = True
     if target is None and wrote_power:
         result["errors"].append(

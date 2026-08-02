@@ -1474,3 +1474,257 @@ def test_a_finished_guard_that_never_wrote_releases_its_claim(tmp_path):
                      state_path=sp)
     again.arm()
     again.restore()
+
+
+# ---------------------------------------------------------------------------
+# Pass 8: findings from the pass-7 protected-surface review.
+# ---------------------------------------------------------------------------
+
+
+def test_state_writes_run_with_the_handled_signals_blocked(tmp_path):
+    """_write_state must not be re-enterable from a signal handler.
+
+    Four call sites (arm, the claim release, and both of restore's write
+    branches) run outside any caller-level signal block. A handler delivered
+    mid-write re-enters here via _signal_restore -> restore: the inner call
+    publishes the newer truth and the interrupted outer frame then resumes and
+    replaces it with its own stale content. The worst instance is restore's
+    failure branch, where the record being overwritten is the only evidence
+    that a still-modified GPU exists.
+    """
+    import joule_agent.gpu_guard as gg
+
+    seen = {}
+    real_mkstemp = gg.tempfile.mkstemp
+
+    def spy(*a, **kw):
+        seen["blocked"] = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        return real_mkstemp(*a, **kw)
+
+    gg.tempfile.mkstemp = spy
+    try:
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+        gg._write_state(tmp_path / "s.json", gg.GuardState(pid=os.getpid()))
+    finally:
+        gg.tempfile.mkstemp = real_mkstemp
+
+    assert signal.SIGINT in seen["blocked"], "SIGINT was deliverable mid-write"
+    assert signal.SIGTERM in seen["blocked"], "SIGTERM was deliverable mid-write"
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, []) == before, (
+        "the mask was not restored"
+    )
+
+
+def test_a_failed_state_write_leaves_no_debris_and_no_lost_record(tmp_path):
+    """A shared temp name let two calls collide on one inode. Prove uniqueness
+    is real by proving the temp file is neither reused nor left behind."""
+    import joule_agent.gpu_guard as gg
+
+    sp = tmp_path / "s.json"
+    gg._write_state(sp, gg.GuardState(pid=1234))
+    good = sp.read_text()
+
+    real_replace = os.replace
+
+    def boom(src, dst):
+        raise OSError("no space left on device")
+
+    os.replace = boom
+    try:
+        with pytest.raises(OSError):
+            gg._write_state(sp, gg.GuardState(pid=5678))
+    finally:
+        os.replace = real_replace
+
+    assert sp.read_text() == good, "a failed write destroyed the live record"
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name != "s.json"]
+    assert leftovers == [], f"temp files left behind: {leftovers}"
+
+
+def test_installing_handlers_twice_does_not_chain_the_guard_to_itself(tmp_path):
+    """The second install must not record the first install's own handler.
+
+    signal.getsignal() returns whatever is currently installed. On a second
+    pass that is self._signal_restore, so _prev_handlers[sig] becomes the
+    guard's own handler -- and _signal_restore's chain-to-previous call at the
+    end then calls itself, unbounded, re-issuing NVML restores all the way
+    down. The process survives a SIGTERM it was meant to die from, and the
+    application's real handler is lost for good.
+    """
+    original = signal.getsignal(signal.SIGINT)
+    g = guard(tmp_path)
+    try:
+        g._install_handlers()
+        g._install_handlers()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            assert g._prev_handlers[sig] is not g._signal_restore, (
+                f"{sig!r}: the guard chained itself to its own handler"
+            )
+        assert g._prev_handlers[signal.SIGINT] is original
+    finally:
+        for sig, prev in g._prev_handlers.items():
+            signal.signal(sig, prev)
+
+
+def test_the_previous_handler_runs_exactly_once_after_a_reused_guard(tmp_path):
+    """The same defect, end to end, in a real process taking a real signal."""
+    script = textwrap.dedent(f"""
+        import signal, sys
+        sys.path.insert(0, {str(Path.cwd())!r})
+        from joule_agent.gpu_guard import FakeGpuController, GpuGuard
+
+        calls = []
+        signal.signal(signal.SIGTERM, lambda s, f: calls.append(s))
+
+        g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path={str(tmp_path / "s.json")!r})
+        with g:
+            pass                      # arms, then surrenders and disarms
+        with g:
+            g.lock_clocks(1400)       # re-arms: handlers installed a second time
+            import os
+            os.kill(os.getpid(), signal.SIGTERM)
+        print("PREV_CALLS", len(calls))
+    """)
+    p = subprocess.run([sys.executable, "-c", script],
+                       capture_output=True, text=True, timeout=60)
+    assert "PREV_CALLS 1" in p.stdout, (
+        f"the application's handler did not run exactly once: "
+        f"{p.stdout!r} {p.stderr[-400:]!r}"
+    )
+    assert "RecursionError" not in p.stderr, "the guard chained into itself"
+
+
+def test_a_surrendered_claim_disarms_so_reuse_rechecks_the_device(tmp_path):
+    """Releasing the claim without disarming leaves a guard that can write
+    hardware while holding nothing on disk.
+
+    `_armed` short-circuits arm(), so a reused guard object would reach the
+    device having never re-run _check_not_busy -- and in the meantime another
+    process is free to arm over the released claim.
+    """
+    sp = tmp_path / "state.json"
+    g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                 state_path=sp)
+    with g:
+        pass                                  # claim published, then surrendered
+    assert g._armed is False, "the guard stayed armed with no claim on disk"
+
+    # Another owner takes the device in the gap.
+    other = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path=sp)
+    other.arm()
+
+    with pytest.raises(GuardBusyError):
+        g.lock_clocks(1400)
+
+
+def test_status_tells_cannot_tell_apart_from_other_card(tmp_path):
+    """Prescribing --gpu N for an unverifiable identity is a non-terminating loop.
+
+    The index is exactly what cannot be trusted in this case, so re-running
+    against it re-enters the same refusal. The report must say the identity is
+    unknowable and name the one action that still works.
+    """
+    sp = tmp_path / "state.json"
+    g = GpuGuard(FakeGpuController(index=0, uuid="GPU-AAAA"), consent=True,
+                 require_root=False, state_path=sp)
+    g.arm()
+    g.lock_clocks(1400)
+
+    class UuidUnreadable(FakeGpuController):
+        def snapshot(self):
+            return replace(super().snapshot(), uuid=None)
+
+    rep = check_stale_state(UuidUnreadable(index=0), sp)
+    assert rep["identity_unverifiable"] is True
+    assert rep["record_is_for_this_device"] is False
+    assert not any("OTHER DEVICE" in f for f in rep["findings"]), (
+        "reported 'cannot tell' as 'other card'"
+    )
+    assert any("UNVERIFIABLE" in f for f in rep["findings"])
+    assert "--force-power-default" in rep["recommendation"]
+
+    # The contrast case must still get the plain --gpu advice.
+    other = check_stale_state(FakeGpuController(index=1, uuid="GPU-BBBB"), sp)
+    assert other["identity_unverifiable"] is False
+    assert any("OTHER DEVICE" in f for f in other["findings"])
+    assert "--gpu 0" in other["recommendation"]
+
+
+def test_force_power_default_does_not_claim_a_write_it_never_made(tmp_path):
+    """An operator who asked for a hardware change must not be told it happened.
+
+    get_power_default_limit_mw is _try-wrapped and swallows every NVML error,
+    so "no default" arrives as None. The flag was set before that was checked,
+    producing power_forced_to_default: true with an empty error list and exit 0.
+    """
+    class NoDefault(FakeGpuController):
+        def get_power_default_limit_mw(self):
+            return None
+
+    c = NoDefault(power_limit_mw=150_000)
+    res = restore_from_state_file(c, tmp_path / "missing.json",
+                                  force_power_default=True)
+
+    assert res.get("power_forced_to_default") is not True, (
+        "claimed a forced write that never happened"
+    )
+    assert res["power_restored_to_mw"] is None
+    assert res["incomplete"] is True
+    assert any("could not be read" in e for e in res["errors"]), res["errors"]
+    assert c.get_power_limit_mw() == 150_000
+
+
+def test_the_busy_message_does_not_overstate_an_arm_only_record(tmp_path):
+    """arm() publishes before the first write, so a record can be unrestored and
+    name no hardware change at all. Saying "the GPU may still be modified" about
+    a record that states the opposite is a false statement in the one place an
+    operator decides what to trust."""
+    sp = tmp_path / "state.json"
+    doc = {
+        "schema": 3,
+        "record": {
+            "pid": 999_999, "started_utc": "2026-01-01T00:00:00+00:00",
+            "device_index": 0, "device_uuid": "GPU-FAKE",
+            "snapshot": {"index": 0, "uuid": "GPU-FAKE"},
+            "clocks_locked": False, "locked_min_mhz": None,
+            "locked_max_mhz": None, "power_limit_written_mw": None,
+            "restored": False, "restored_utc": None,
+            "restore_failed": False, "restore_errors": [],
+        },
+    }
+    sp.write_text(json.dumps(doc))
+
+    with pytest.raises(GuardBusyError) as exc:
+        guard(tmp_path).arm()
+    msg = str(exc.value)
+    assert "may still be modified" not in msg, msg
+    assert "no clock lock and no power write" in msg
+    assert "restore --gpu 0" in msg, "the resolving command is not named"
+
+    # A record that DOES name a write must still say so.
+    doc["record"]["clocks_locked"] = True
+    doc["record"]["locked_min_mhz"] = 1400
+    doc["record"]["locked_max_mhz"] = 1400
+    sp.write_text(json.dumps(doc))
+    with pytest.raises(GuardBusyError) as exc2:
+        guard(tmp_path).arm()
+    assert "may still be modified" in str(exc2.value)
+
+
+def test_a_caller_without_consent_leaves_no_claim_behind(tmp_path):
+    """arm() publishes a claim, so consent must be checked before it runs.
+
+    Otherwise a caller that was never allowed to touch the device leaves an
+    operator-visible record on disk, and a kill in that window strands it.
+    """
+    sp = tmp_path / "state.json"
+    for call in (lambda g: g.lock_clocks(1400),
+                 lambda g: g.set_power_limit_mw(150_000)):
+        g = GpuGuard(FakeGpuController(), consent=False, require_root=False,
+                     state_path=sp)
+        with pytest.raises(ConsentError):
+            call(g)
+        assert not sp.exists(), "a consent-refused caller published a claim"
+        assert g._armed is False
