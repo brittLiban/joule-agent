@@ -21,6 +21,7 @@ import sys
 import textwrap
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -1270,3 +1271,206 @@ def test_matching_uuid_is_accepted_even_if_the_index_moved(tmp_path):
     res = restore_from_state_file(now_0, sp)
     assert res["errors"] == []
     assert res["record_cleared"] is True
+
+
+# ---------------------------------------------------------------------------
+# Pass 7: three defects re-derived after reverting an over-large rewrite.
+# Each is a hole in the *kept* core, not in machinery added by a review pass.
+# ---------------------------------------------------------------------------
+
+
+def test_arming_publishes_the_record_before_the_first_hardware_write(tmp_path):
+    """Two guards must not both get past arm().
+
+    `_check_not_busy` reads the state file, but the record was only written at
+    the first hardware touch. Between one guard's arm() and its first write, a
+    second guard saw a clean file and armed too. Both then held snapshots and
+    both wrote the file wholesale, so the second one's record ERASED the first
+    one's -- and a record that says `power_limit_written_mw: null` tells
+    recovery to leave a cap the first guard actually applied.
+
+    The window closes only if arming itself publishes the claim.
+    """
+    sp = tmp_path / "state.json"
+    first = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path=sp)
+    first.arm()
+
+    # No hardware touched yet -- this is the whole window.
+    assert first.state.power_limit_written_mw is None
+    assert first.state.clocks_locked is False
+
+    assert sp.exists(), "arm() left no evidence, so the claim is invisible"
+    assert record(sp)["restored"] is False, (
+        "the published claim must read as unrestored, or a second guard's "
+        "_check_not_busy will step straight over it"
+    )
+
+    second = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                      state_path=sp)
+    with pytest.raises(GuardBusyError):
+        second.arm()
+
+
+def test_a_second_process_cannot_arm_during_the_pre_touch_window(tmp_path):
+    """The same race across processes, where the in-process claim cannot help.
+
+    Two guards in one process are refused by the controller claim. Two
+    processes hold separate controller objects, so only the state file stands
+    between them.
+    """
+    sp = tmp_path / "state.json"
+    holder = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                      state_path=sp)
+    holder.arm()                       # armed, nothing written to hardware
+
+    probe = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(f"""
+            import sys
+            sys.path.insert(0, {str(Path.cwd())!r})
+            from joule_agent.gpu_guard import (
+                FakeGpuController, GpuGuard, GuardBusyError)
+            g = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                         state_path={str(sp)!r})
+            try:
+                g.arm()
+            except GuardBusyError:
+                print("REFUSED")
+            else:
+                print("ARMED")
+        """)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert "REFUSED" in probe.stdout, (
+        f"a second process armed over a live claim: {probe.stdout!r} "
+        f"{probe.stderr!r}"
+    )
+
+
+def test_a_cleared_record_does_not_replay_power_over_a_later_operator_cap(tmp_path):
+    """`restored: true` means the debt is settled, not that it is still owed.
+
+    Nothing clears `power_limit_written_mw` when restore succeeds, so a
+    finished run leaves a clean record that still names a power write. Recovery
+    read that field alone and rewrote the snapshot's historical limit --
+    silently undoing a cap the operator set AFTER the run finished, and
+    reporting success.
+    """
+    sp = tmp_path / "state.json"
+    c = FakeGpuController(power_limit_mw=200_000, power_default_limit_mw=200_000)
+    with GpuGuard(c, consent=True, require_root=False, state_path=sp) as g:
+        g.set_power_limit_mw(150_000)
+
+    settled = record(sp)
+    assert settled["restored"] is True
+    assert settled["power_limit_written_mw"] == 150_000, (
+        "precondition: the cleared record still names the historical write"
+    )
+    assert c.get_power_limit_mw() == 200_000
+
+    # The operator deliberately caps the card after the run. Recovery runs in
+    # its own process, so it gets its own controller for the same card.
+    later = FakeGpuController(power_limit_mw=180_000,
+                              power_default_limit_mw=200_000)
+
+    res = restore_from_state_file(later, sp)
+
+    assert later.get_power_limit_mw() == 180_000, (
+        "recovery replayed a settled record's power write over a later "
+        "operator cap"
+    )
+    assert later.set_power_calls == 0
+    assert res["power_restored_to_mw"] is None
+    assert res["reset_clocks"] is True      # belt-and-braces still unconditional
+
+
+def test_an_unreadable_live_uuid_is_not_covered_by_a_matching_index(tmp_path):
+    """An index match is not evidence when the identity cannot be read.
+
+    A record that carries a UUID was written by a guard that could read one.
+    If the live UUID read fails, identity is UNVERIFIABLE -- but the comparison
+    fell through to the index, and an index match returned "no mismatch". After
+    a re-enumeration that is precisely the case where the index lies, so the
+    fallback accepted the one situation it exists to catch.
+    """
+    sp = tmp_path / "state.json"
+    written_by = FakeGpuController(index=0, uuid="GPU-AAAA")
+    g = GpuGuard(written_by, consent=True, require_root=False, state_path=sp)
+    g.arm()
+    g.lock_clocks(1400)
+    g.set_power_limit_mw(150_000)
+
+    class UuidUnreadable(FakeGpuController):
+        def snapshot(self):
+            snap = super().snapshot()
+            return replace(snap, uuid=None)
+
+    # Same index, unknowable identity: may or may not be the recorded card.
+    unknown = UuidUnreadable(index=0, uuid="GPU-AAAA",
+                             power_limit_mw=180_000,
+                             power_default_limit_mw=200_000)
+    res = restore_from_state_file(unknown, sp)
+
+    assert res["incomplete"] is True
+    assert any("identity" in e for e in res["errors"]), res["errors"]
+    assert res["power_restored_to_mw"] is None, (
+        "applied a snapshot from a record whose device could not be confirmed"
+    )
+    assert res["record_cleared"] is False, (
+        "cleared the only evidence for a card that may still be modified"
+    )
+    assert unknown.get_power_limit_mw() == 180_000
+    assert res["reset_clocks"] is True
+
+
+def test_force_power_default_still_escapes_an_unverifiable_identity(tmp_path):
+    """Fail-closed must not mean fail-stuck.
+
+    Refusing on an unreadable UUID is only acceptable if the operator retains a
+    way to put the card back. --force-power-default needs no snapshot, so it
+    must survive the refusal.
+    """
+    sp = tmp_path / "state.json"
+    g = GpuGuard(FakeGpuController(index=0, uuid="GPU-AAAA"), consent=True,
+                 require_root=False, state_path=sp)
+    g.arm()
+    g.set_power_limit_mw(150_000)
+
+    class UuidUnreadable(FakeGpuController):
+        def snapshot(self):
+            return replace(super().snapshot(), uuid=None)
+
+    unknown = UuidUnreadable(index=0, power_limit_mw=150_000,
+                             power_default_limit_mw=200_000)
+    res = restore_from_state_file(unknown, sp, force_power_default=True)
+
+    assert unknown.get_power_limit_mw() == 200_000
+    assert res["power_restored_to_mw"] == 200_000
+    assert res["incomplete"] is True, (
+        "the identity refusal must still be reported; only the cap was undone"
+    )
+
+
+def test_a_finished_guard_that_never_wrote_releases_its_claim(tmp_path):
+    """Publishing a claim at arm() is only safe if exiting releases it.
+
+    A guard that arms, writes nothing, and exits cleanly must not leave a
+    record saying the device is held. If it does, the next run reads a live
+    claim from a dead pid and refuses to arm -- and `status` reports a stale
+    record that names no hardware change at all.
+
+    The release must not reset clocks: a guard that never wrote must not touch
+    the device on its way out.
+    """
+    sp = tmp_path / "state.json"
+    c = FakeGpuController()
+    with GpuGuard(c, consent=True, require_root=False, state_path=sp):
+        assert record(sp)["restored"] is False, "precondition: claim published"
+    assert record(sp)["restored"] is True, "the claim outlived the guard"
+    assert c.reset_calls == 0, "releasing an unwritten claim touched hardware"
+
+    # The next run must be able to arm over it.
+    again = GpuGuard(FakeGpuController(), consent=True, require_root=False,
+                     state_path=sp)
+    again.arm()
+    again.restore()

@@ -577,6 +577,16 @@ def _controller_identity(controller) -> tuple:
     return idx, uuid
 
 
+#: Marks the one mismatch reason that is "cannot tell" rather than "wrong card".
+#: The advice differs: naming --gpu N is useless when the index is exactly what
+#: cannot be trusted.
+_UNVERIFIABLE = "identity unverifiable:"
+
+
+def _identity_unverifiable(reason: str | None) -> bool:
+    return bool(reason) and reason.startswith(_UNVERIFIABLE)
+
+
 def _device_mismatch(record: dict, controller) -> str | None:
     """Describe why `record` is not about `controller`'s device, or None.
 
@@ -600,6 +610,22 @@ def _device_mismatch(record: dict, controller) -> str | None:
         )
     if uuid and rec_uuid and uuid == rec_uuid:
         return None                     # UUID match is authoritative
+    if rec_uuid and not uuid:
+        # The record was written by a guard that COULD read a UUID, so the
+        # identity is knowable in principle and simply is not readable now.
+        # Falling through to the index would accept exactly the case the UUID
+        # exists to catch: after a re-enumeration the indexes match and mean
+        # different cards. Unverifiable is not the same as verified.
+        return (
+            f"{_UNVERIFIABLE} the record names device {rec_uuid} but this "
+            "controller's UUID could not be read"
+            + (
+                f" (both report index {idx}, which proves nothing once the "
+                "enumeration may have changed)"
+                if rec_idx == idx
+                else f" (record index {rec_idx}, controller index {idx})"
+            )
+        )
     if idx is not None and rec_idx is not None and rec_idx != idx:
         return (
             f"the record names GPU {rec_idx} but this controller holds GPU "
@@ -777,10 +803,25 @@ class GpuGuard:
             device_index=self.snapshot.index,
             device_uuid=self.snapshot.uuid,
             snapshot=self.snapshot.to_dict(),
-            restored=True,
+            restored=False,
         )
         self._owner_thread = threading.get_ident()
         self._install_handlers()
+        # Publish the claim HERE, not at the first hardware write. _check_not_busy
+        # can only see what is on disk, so a record that appears only on first
+        # touch leaves a window in which a second process reads a clean file and
+        # arms too. Both then hold "stock" snapshots and both write the file
+        # wholesale, so the later record erases the earlier one -- and a record
+        # saying power_limit_written_mw: null tells recovery to leave a cap the
+        # first guard really did apply.
+        #
+        # `restored: False` here means "a guard holds this device", not "the
+        # hardware is modified". Those are different facts and only the first is
+        # knowable at arm time; the record's own clocks_locked and
+        # power_limit_written_mw fields carry the second, and recovery reads
+        # them, so nothing downstream is misled.  self._restored stays True
+        # because there is no hardware debt yet -- see restore().
+        _write_state(self._state_path, self.state)
         self._armed = True
         return self
 
@@ -895,6 +936,17 @@ class GpuGuard:
 
     # -- restore ---------------------------------------------------------
 
+    def _clear_unwritten_claim(self) -> None:
+        """Release the arm-time claim of a guard that never touched hardware."""
+        if self.state is None or self.state.restored:
+            return
+        self.state.restored = True
+        self.state.restored_utc = _utcnow()
+        try:
+            _write_state(self._state_path, self.state)
+        except Exception:
+            pass
+
     def restore(self) -> None:
         """Return the GPU to stock. Idempotent; safe to call any number of times.
 
@@ -910,6 +962,11 @@ class GpuGuard:
         another thread.
         """
         if self._restored:
+            # No hardware debt -- but arm() published a claim, and leaving it on
+            # disk would make the next arm refuse over a guard that has finished.
+            # Clearing it must NOT reset clocks: a guard that never wrote must
+            # not touch the device on the way out.
+            self._clear_unwritten_claim()
             return
         errors = []
         try:
@@ -1181,8 +1238,15 @@ def restore_from_state_file(
         result["errors"].append(
             f"device identity mismatch: {mismatch}. Refusing to write that "
             "device's snapshot here or to clear its record -- doing so would "
-            "mis-cap this card and destroy the other card's evidence. Re-run "
-            f"with --gpu {rec_dev}."
+            "mis-cap this card and destroy the other card's evidence. "
+            + (
+                "Fix the UUID read (a driver reload usually restores it) and "
+                "re-run; if the cap must come off now, --force-power-default "
+                "resets this card to its own default without applying anyone "
+                "else's snapshot, and leaves the record intact."
+                if _identity_unverifiable(mismatch)
+                else f"Re-run with --gpu {rec_dev}."
+            )
         )
         prior = None      # do not use it for power, do not clear it
 
@@ -1196,9 +1260,19 @@ def restore_from_state_file(
     except Exception as exc:
         result["errors"].append(f"reset_locked_clocks: {exc}")
 
-    # Restore power only if the record says WE changed it. Rewriting the limit
-    # unconditionally would wipe an operator's deliberate pre-existing cap.
-    wrote_power = bool(prior and prior.get("power_limit_written_mw") is not None)
+    # Restore power only if the record says we changed it AND have not already
+    # put it back. Nothing clears power_limit_written_mw on a successful
+    # restore, so a finished run leaves a clean record that still names its
+    # historical write; treating that field alone as "a cap is outstanding"
+    # made recovery replay the snapshot's old limit over whatever the operator
+    # set afterwards, and report success. `restored` is the field that says
+    # whether the debt is still owed. Absent, it is read as settled: a record
+    # that cannot say it owes anything must not authorise a hardware write.
+    wrote_power = bool(
+        prior
+        and prior.get("power_limit_written_mw") is not None
+        and not prior.get("restored", True)
+    )
     target = None
     if wrote_power:
         snap = (prior or {}).get("snapshot") or {}
