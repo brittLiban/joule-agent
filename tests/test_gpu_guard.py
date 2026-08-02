@@ -1898,3 +1898,64 @@ def test_a_failed_claim_release_also_leaves_the_retry_alive(tmp_path):
     assert record(sp)["restored"] is True, "the claim was never released"
     assert g._armed is False
     assert c.reset_calls == 0
+
+
+def test_a_moved_enumeration_is_not_told_to_re_run_the_command_that_failed(tmp_path):
+    """The recorded index still points here, but at a different card.
+
+    Whatever sent the operator to `--gpu 0` sends them here again, so that
+    advice cannot terminate. The sibling case (unverifiable identity) was fixed
+    in pass 8 with exactly this reasoning; this one was left with the loop. The
+    only usable handle left is the recorded UUID.
+    """
+    sp = tmp_path / "state.json"
+    was_here = FakeGpuController(index=0, uuid="GPU-AAAA")
+    g = GpuGuard(was_here, consent=True, require_root=False, state_path=sp)
+    g.arm()
+    g.lock_clocks(1400)
+    g.set_power_limit_mw(150_000)
+
+    # A reboot re-enumerates: index 0 is now a different physical card.
+    now_here = FakeGpuController(index=0, uuid="GPU-BBBB",
+                                 power_limit_mw=180_000)
+
+    rep = check_stale_state(now_here, sp)
+    assert rep["record_index_no_longer_locates"] is True
+    assert rep["identity_unverifiable"] is False
+    assert any("RE-ENUMERATED" in f for f in rep["findings"])
+    assert "--gpu 0" not in rep["recommendation"], (
+        "prescribed the index that just failed -- a loop with no exit"
+    )
+    assert "GPU-AAAA" in rep["recommendation"], "the recorded UUID is the handle"
+    assert "nvidia-smi" in rep["recommendation"]
+
+    res = restore_from_state_file(now_here, sp)
+    assert res["incomplete"] is True
+    assert res["record_cleared"] is False
+    assert now_here.get_power_limit_mw() == 180_000, "mis-capped the wrong card"
+    joined = " ".join(res["errors"])
+    assert "--gpu 0" not in joined, joined
+    assert "GPU-AAAA" in joined and "nvidia-smi" in joined
+
+
+def test_a_moved_card_still_gets_the_plain_gpu_flag(tmp_path):
+    """The contrast case the new branch must not capture.
+
+    When the indexes differ, --gpu <recorded index> is exactly right and the
+    operator should not be sent on a UUID hunt.
+    """
+    sp = tmp_path / "state.json"
+    g = GpuGuard(FakeGpuController(index=1, uuid="GPU-AAAA"), consent=True,
+                 require_root=False, state_path=sp)
+    g.arm()
+    g.lock_clocks(1400)
+
+    elsewhere = FakeGpuController(index=0, uuid="GPU-BBBB")
+    rep = check_stale_state(elsewhere, sp)
+    assert rep["record_index_no_longer_locates"] is False
+    assert any("OTHER DEVICE" in f for f in rep["findings"])
+    assert "--gpu 1" in rep["recommendation"]
+    assert "nvidia-smi" not in rep["recommendation"]
+
+    res = restore_from_state_file(elsewhere, sp)
+    assert "--gpu 1" in " ".join(res["errors"])

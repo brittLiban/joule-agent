@@ -613,9 +613,41 @@ def _controller_identity(controller) -> tuple:
 #: cannot be trusted.
 _UNVERIFIABLE = "identity unverifiable:"
 
+#: Marks a PROVEN mismatch where the recorded index nonetheless still matches --
+#: the enumeration moved under the record. Same advisory problem for a different
+#: reason: --gpu <recorded index> is the command that just failed, so repeating
+#: it never terminates. The recorded UUID is the only usable handle left.
+_REENUMERATED = "enumeration changed:"
+
 
 def _identity_unverifiable(reason: str | None) -> bool:
     return bool(reason) and reason.startswith(_UNVERIFIABLE)
+
+
+def _index_no_longer_locates(reason: str | None) -> bool:
+    """True when the record's own --gpu can no longer reach the card it names."""
+    return bool(reason) and reason.startswith(_REENUMERATED)
+
+
+def _find_the_recorded_card(record: dict) -> str:
+    """One sentence that terminates, for both the present and absent cases.
+
+    Deliberately points at nvidia-smi rather than enumerating devices here. A
+    lookup helper would need a new controller method, a fake-peer fixture, and
+    NVML handles for cards this guard was never given -- machinery bought to
+    avoid writing a sentence, and it would still only cover the case where the
+    card is present.
+    """
+    rec_uuid = record.get("device_uuid")
+    return (
+        "Find where that card is now: `nvidia-smi --query-gpu=index,uuid "
+        f"--format=csv` -- then re-run recovery with the index that holds "
+        f"{rec_uuid}, NOT the one in the record. If that UUID is not listed, "
+        "the card is no longer on this machine; its clocks went with it, and "
+        "the record can only be retired by a human who confirms that. Move the "
+        "state file aside, the same move --quarantine-unreadable makes, done "
+        "deliberately because nothing in code can attribute it."
+    )
 
 
 def _device_mismatch(record: dict, controller) -> str | None:
@@ -629,15 +661,19 @@ def _device_mismatch(record: dict, controller) -> str | None:
     rec_uuid = record.get("device_uuid")
     rec_idx = record.get("device_index")
     if uuid and rec_uuid and uuid != rec_uuid:
+        if rec_idx == idx:
+            # Proven different cards, yet the record's own index points HERE.
+            # Whatever sent the operator to `--gpu {rec_idx}` will send them
+            # here again, so that advice cannot terminate.
+            return (
+                f"{_REENUMERATED} the record is for device {rec_uuid} but this "
+                f"controller holds {uuid}, and both report index {idx} -- the "
+                "enumeration moved under the record, so its index no longer "
+                "locates the card it names"
+            )
         return (
             f"the record is for device {rec_uuid} but this controller holds "
-            f"{uuid}"
-            + (
-                f" (both report index {idx}; the enumeration changed, so the "
-                "index is not proof of identity)"
-                if rec_idx == idx
-                else f" (record index {rec_idx}, controller index {idx})"
-            )
+            f"{uuid} (record index {rec_idx}, controller index {idx})"
         )
     if uuid and rec_uuid and uuid == rec_uuid:
         return None                     # UUID match is authoritative
@@ -1251,6 +1287,20 @@ def check_stale_state(
         # would send an operator to reset the wrong GPU.
         report["stale"] = True
         report["identity_unverifiable"] = _identity_unverifiable(mismatch)
+        report["record_index_no_longer_locates"] = _index_no_longer_locates(
+            mismatch
+        )
+        if report["record_index_no_longer_locates"]:
+            # A PROVEN mismatch, but the record's own index points at this very
+            # controller. Recommending --gpu <that index> would send the
+            # operator straight back into the refusal they just hit.
+            report["findings"].append(
+                f"RE-ENUMERATED (state file): {mismatch}. Nothing here is "
+                f"evidence about GPU {dev}, and the record's index cannot be "
+                "used to reach the card it names."
+            )
+            report["recommendation"] = _find_the_recorded_card(prior)
+            return report
         if report["identity_unverifiable"]:
             # "Cannot tell" is not "other card". Naming --gpu N here would
             # prescribe the one thing the code just said proves nothing, and
@@ -1380,6 +1430,7 @@ def restore_from_state_file(
     mismatch = _device_mismatch(prior, controller) if prior else None
     if mismatch:
         rec_dev = prior.get("device_index")
+        rec_for_advice = prior
         result["incomplete"] = True
         result["record_device_index"] = rec_dev
         result["record_device_uuid"] = prior.get("device_uuid")
@@ -1393,6 +1444,8 @@ def restore_from_state_file(
                 "resets this card to its own default without applying anyone "
                 "else's snapshot, and leaves the record intact."
                 if _identity_unverifiable(mismatch)
+                else _find_the_recorded_card(rec_for_advice)
+                if _index_no_longer_locates(mismatch)
                 else f"Re-run with --gpu {rec_dev}."
             )
         )
