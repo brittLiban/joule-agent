@@ -38,6 +38,13 @@ from joule_agent.gpu_guard import (
 )
 
 
+def record(state_path, pid=None) -> dict:
+    """Read one guard record from the per-pid state document."""
+    doc = json.loads(Path(state_path).read_text())
+    guards = doc["guards"]
+    return guards[str(pid)] if pid is not None else next(iter(guards.values()))
+
+
 def guard(tmp_path, **kw) -> GpuGuard:
     kw.setdefault("consent", True)
     kw.setdefault("require_root", False)  # privilege is tested separately
@@ -223,11 +230,11 @@ def test_state_file_marks_unrestored_while_held(tmp_path):
     g = guard(tmp_path, controller=c)
     with g:
         g.lock_clocks(1400)
-        mid = json.loads(sp.read_text())
+        mid = record(sp)
         assert mid["restored"] is False
         assert mid["clocks_locked"] is True
         assert mid["locked_min_mhz"] == 1400
-    after = json.loads(sp.read_text())
+    after = record(sp)
     assert after["restored"] is True
     assert after["clocks_locked"] is False
 
@@ -237,7 +244,7 @@ def test_state_file_documents_that_clock_lock_is_asserted(tmp_path):
     sp = tmp_path / "state.json"
     with guard(tmp_path) as g:
         g.lock_clocks(1400)
-    note = json.loads(sp.read_text())["_note"]
+    note = record(sp)["_note"]
     assert "ASSERTED" in note or "asserted" in note.lower()
 
 
@@ -289,24 +296,59 @@ def test_live_writer_pid_is_distinguished_from_a_dead_one(tmp_path):
 
 
 def test_restore_from_state_file_is_unconditional(tmp_path):
+    """Clock reset always fires; power follows only a record of OUR write."""
     sp = tmp_path / "state.json"
     sp.write_text(json.dumps({
-        "pid": 999999, "restored": False, "clocks_locked": True,
-        "snapshot": {"power_default_limit_mw": 200_000},
+        "schema": 2,
+        "guards": {"999999": {
+            "pid": 999999, "restored": False, "clocks_locked": True,
+            "power_limit_written_mw": 120_000,
+            "snapshot": {"power_limit_mw": 200_000,
+                         "power_default_limit_mw": 200_000},
+        }},
     }))
     c = FakeGpuController(power_limit_mw=120_000, power_default_limit_mw=200_000)
     res = restore_from_state_file(c, sp)
     assert res["reset_clocks"] is True
     assert res["power_restored_to_mw"] == 200_000
     assert c.get_power_limit_mw() == 200_000
-    assert json.loads(sp.read_text())["restored"] is True
+    assert record(sp, 999999)["restored"] is True
 
 
-def test_recovery_works_with_no_state_file_at_all(tmp_path):
+def test_schema1_state_file_still_recoverable(tmp_path):
+    """A flat record from an older build must not become unrecoverable."""
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({
+        "pid": 999999, "restored": False, "clocks_locked": True,
+        "power_limit_written_mw": 120_000,
+        "snapshot": {"power_limit_mw": 200_000},
+    }))
+    rep = check_stale_state(FakeGpuController(), sp)
+    assert rep["stale"] is True
+    assert rep["asserted_clock_lock"] is True
+
+
+def test_power_untouched_when_no_record_claims_it(tmp_path):
+    """An operator's deliberate cap must not be wiped by a recovery run."""
     c = FakeGpuController(power_limit_mw=120_000, power_default_limit_mw=200_000)
     res = restore_from_state_file(c, tmp_path / "missing.json")
     assert res["reset_clocks"] is True
+    assert res["power_restored_to_mw"] is None
+    assert c.get_power_limit_mw() == 120_000, "recovery undid an operator cap"
+    assert "power_untouched_reason" in res
+
+
+def test_force_power_default_is_the_explicit_override(tmp_path):
+    c = FakeGpuController(power_limit_mw=120_000, power_default_limit_mw=200_000)
+    res = restore_from_state_file(c, tmp_path / "missing.json", force_power_default=True)
+    assert res["power_restored_to_mw"] == 200_000
     assert c.get_power_limit_mw() == 200_000
+
+
+def test_recovery_resets_clocks_even_with_no_state_file(tmp_path):
+    c = FakeGpuController(power_limit_mw=200_000, power_default_limit_mw=200_000)
+    res = restore_from_state_file(c, tmp_path / "missing.json")
+    assert res["reset_clocks"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +427,7 @@ def test_child_process_restores_on_signal(tmp_path, sig):
     proc.wait(timeout=30)
     assert marker.exists(), f"{sig!r} did not trigger restore"
     assert "restored" in marker.read_text()
-    assert json.loads(state.read_text())["restored"] is True
+    assert record(state, proc.pid)["restored"] is True
 
 
 def test_sigkill_leaves_recoverable_state_file(tmp_path):
@@ -397,7 +439,7 @@ def test_sigkill_leaves_recoverable_state_file(tmp_path):
     # No handler could have run.
     assert not marker.exists(), "restore ran despite SIGKILL?"
     # But the file records the un-restored lock, written before the hardware write.
-    recorded = json.loads(state.read_text())
+    recorded = record(state, proc.pid)
     assert recorded["restored"] is False
     assert recorded["clocks_locked"] is True
 
@@ -408,7 +450,7 @@ def test_sigkill_leaves_recoverable_state_file(tmp_path):
     c = FakeGpuController()
     res = restore_from_state_file(c, state)
     assert res["reset_clocks"] is True
-    assert json.loads(state.read_text())["restored"] is True
+    assert record(state, proc.pid)["restored"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -444,3 +486,348 @@ def test_broken_power_restore_is_caught(tmp_path):
     assert c.get_power_limit_mw() == 120_000
     with pytest.raises(AssertionError):
         assert c.get_power_limit_mw() == 200_000
+
+
+# ---------------------------------------------------------------------------
+# regressions from the hardware-safety-reviewer pass
+# ---------------------------------------------------------------------------
+
+
+class RaisingRestore(FakeGpuController):
+    """Hardware refuses the reset -- the case that used to be recorded as success."""
+
+    def reset_locked_clocks(self):
+        self._require_claim()
+        self.reset_calls += 1
+        raise RuntimeError("NVML reset failed")
+
+
+def test_failed_restore_does_not_record_success(tmp_path):
+    """F1, the severe one.
+
+    A failed reset previously wrote restored:true, leaving the device locked
+    with the only evidence erased and every retry path disarmed. Because there
+    is no readback, that state file is all there is.
+    """
+    sp = tmp_path / "state.json"
+    c = RaisingRestore()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+    with pytest.raises(GpuGuardError, match="MAY STILL BE MODIFIED"):
+        with g:
+            g.lock_clocks(1400)
+
+    assert c.locked == (1400, 1400), "precondition: device still locked"
+    assert g._restored is False, "guard must stay armed after a failed restore"
+    rec = record(sp)
+    assert rec["restored"] is False, "failed restore recorded as success"
+    assert rec["restore_failed"] is True
+    assert rec["restore_errors"]
+
+
+def test_failed_restore_leaves_retry_armed(tmp_path):
+    c = RaisingRestore()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
+    with pytest.raises(GpuGuardError):
+        with g:
+            g.lock_clocks(1400)
+    before = c.reset_calls
+    with pytest.raises(GpuGuardError):
+        g.restore()
+    assert c.reset_calls > before, "retry was suppressed after a failed restore"
+
+
+def test_failed_restore_is_visible_to_stale_check(tmp_path):
+    sp = tmp_path / "state.json"
+    c = RaisingRestore()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+    with pytest.raises(GpuGuardError):
+        with g:
+            g.lock_clocks(1400)
+    rep = check_stale_state(FakeGpuController(), sp)
+    assert rep["stale"] is True
+    assert rep["restore_failed"] is True
+    assert any("RESTORE FAILED" in f for f in rep["findings"])
+
+
+def test_unclaimed_controller_refuses_direct_writes(tmp_path):
+    """F5: constructing a controller must not grant a bypass around the guard."""
+    c = FakeGpuController()
+    with pytest.raises(GpuGuardError, match="not held by a GpuGuard"):
+        c.set_locked_clocks(100, 100)
+    with pytest.raises(GpuGuardError):
+        c.set_power_limit_mw(50_000)
+    assert c.set_clock_calls == 0
+
+
+def test_guard_claims_its_controller(tmp_path):
+    c = FakeGpuController()
+    with guard(tmp_path, controller=c) as g:
+        g.lock_clocks(1400)
+        assert c.locked == (1400, 1400)
+
+
+def test_concurrent_guards_do_not_clobber_each_others_records(tmp_path):
+    """F4: a clean restore by one guard must not erase another's live record."""
+    sp = tmp_path / "state.json"
+    a = FakeGpuController()
+    b = FakeGpuController()
+    ga = GpuGuard(a, consent=True, require_root=False, state_path=sp)
+    gb = GpuGuard(b, consent=True, require_root=False, state_path=sp)
+    ga.arm(); gb.arm()
+    ga.state.pid = 1111
+    gb.state.pid = 2222
+    ga.lock_clocks(1400)
+    gb.lock_clocks(900)
+    ga.restore()
+
+    doc = json.loads(sp.read_text())
+    assert doc["guards"]["1111"]["restored"] is True
+    assert doc["guards"]["2222"]["restored"] is False, "B's record was clobbered"
+    rep = check_stale_state(FakeGpuController(), sp)
+    assert rep["stale"] is True, "B still holds a lock but status reported clean"
+
+
+def test_power_limit_of_zero_is_still_restored(tmp_path):
+    """F7: 0 mW is falsy; a truthiness gate skipped the restore entirely."""
+    c = FakeGpuController(power_limit_mw=200_000, power_default_limit_mw=200_000)
+    g = guard(tmp_path, controller=c)
+    g.arm()
+    g.snapshot.power_min_mw = None   # constraints unreadable, as on GeForce
+    g.snapshot.power_max_mw = None
+    with g:
+        g.set_power_limit_mw(0)
+        assert c.get_power_limit_mw() == 0
+    assert c.get_power_limit_mw() == 200_000, "0 mW write was never restored"
+
+
+def test_restore_targets_observed_limit_not_factory_default(tmp_path):
+    """F9: an operator's pre-existing cap must survive our restore."""
+    c = FakeGpuController(power_limit_mw=150_000, power_default_limit_mw=200_000)
+    with guard(tmp_path, controller=c) as g:
+        g.set_power_limit_mw(120_000)
+    assert c.get_power_limit_mw() == 150_000, "restore overshot to factory default"
+
+
+def test_write_through_closed_controller_fails_loudly(tmp_path):
+    """F8, tested against the REAL controller's _write, not a hand-written stub.
+
+    The previous version of this test asserted a message raised by its own
+    fixture, so deleting the production check left it green.
+    """
+    from joule_agent.gpu_guard import NvmlGpuController
+
+    c = object.__new__(NvmlGpuController)   # no NVML init
+    c._closed = True
+    c._claimed_by = "test"
+    called = []
+    with pytest.raises(GpuGuardError, match="closed"):
+        c._write(lambda: called.append(1))
+    assert called == [], "a closed controller still issued the write"
+
+
+def test_write_through_unclaimed_real_controller_is_refused():
+    from joule_agent.gpu_guard import NvmlGpuController
+
+    c = object.__new__(NvmlGpuController)
+    c._closed = False
+    c._claimed_by = None
+    with pytest.raises(GpuGuardError, match="not held by a GpuGuard"):
+        c._write(lambda: None)
+
+
+def test_sig_ign_is_not_converted_into_process_death(tmp_path, monkeypatch):
+    """F6, asserted on os.kill rather than on process survival.
+
+    Survival alone does not discriminate: `prev` (SIG_IGN) is reinstalled
+    before dispatch, so a fallthrough os.kill would be swallowed by the OS and
+    the process would live either way.
+    """
+    import joule_agent.gpu_guard as gg
+
+    killed = []
+    monkeypatch.setattr(gg.os, "kill", lambda pid, sig: killed.append(sig))
+
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
+    prev = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        g.arm()
+        g.lock_clocks(1400)
+        g._signal_restore(signal.SIGTERM, None)
+        assert c.locked is None, "restore did not run"
+        assert killed == [], f"guard killed a process that ignores SIGTERM: {killed}"
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+
+
+def test_handler_install_failure_is_recorded_not_silent(tmp_path, capfd):
+    """F2: the load-bearing half is the stderr warning, not an in-memory list."""
+    import threading as _t
+
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
+    th = _t.Thread(target=g.arm)
+    th.start(); th.join()
+
+    err = capfd.readouterr().err
+    assert g.handler_install_failures, "off-main-thread arm reported no degradation"
+    assert "WARNING [gpu_guard]" in err, "degradation was silent on stderr"
+    assert "not armed" in err.lower() or "NOT armed" in err
+
+
+def test_atexit_restore_reports_failure_on_stderr(tmp_path, capfd):
+    """F3 had no coverage at all; a bare `except: pass` would pass silently."""
+    c = RaisingRestore()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=tmp_path / "s.json")
+    g.arm()
+    g.lock_clocks(1400)
+    g._atexit_restore()          # must not raise, must not be silent
+    err = capfd.readouterr().err
+    assert "ERROR [gpu_guard]" in err
+    assert "restore failed during exit" in err
+
+
+# ---------------------------------------------------------------------------
+# second-pass regressions
+# ---------------------------------------------------------------------------
+
+
+def test_signal_during_a_write_does_not_record_a_false_clean(tmp_path):
+    """A signal handler can land BETWEEN the state write and the hardware write.
+
+    It re-enters restore() through the RLock, marks everything clean, returns,
+    and the interrupted frame then applies the lock -- GPU modified, disk clean.
+    """
+    sp = tmp_path / "state.json"
+
+    class SignalMidWrite(FakeGpuController):
+        guard = None
+        _fired = False
+
+        def set_locked_clocks(self, mn, mx):
+            self._require_claim()
+            if self.guard is not None and not self._fired:
+                self._fired = True
+                self.guard._signal_restore(signal.SIGTERM, None)
+            self.set_clock_calls += 1
+            self.locked = (mn, mx)
+
+    c = SignalMidWrite()
+    prev = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+        c.guard = g
+        g.arm()
+        g.lock_clocks(1400)
+        assert c.locked == (1400, 1400), "precondition: the lock was applied"
+        assert g._restored is False, "guard disarmed while the GPU is modified"
+        assert record(sp)["restored"] is False, "disk claims clean, GPU is locked"
+        assert check_stale_state(FakeGpuController(), sp)["stale"] is True
+    finally:
+        signal.signal(signal.SIGTERM, prev)
+
+
+def test_unknown_power_restore_target_is_an_error_not_a_skip(tmp_path):
+    """If both snapshot reads failed, we cannot restore -- and must say so."""
+    c = FakeGpuController(power_limit_mw=200_000, power_default_limit_mw=200_000)
+    g = guard(tmp_path, controller=c)
+    g.arm()
+    g.snapshot.power_limit_mw = None        # both NVML reads failed at arm()
+    g.snapshot.power_default_limit_mw = None
+    g.snapshot.power_min_mw = None
+    g.snapshot.power_max_mw = None
+    g.set_power_limit_mw(120_000)
+    with pytest.raises(GpuGuardError, match="no restore target is known"):
+        g.restore()
+    assert g._restored is False
+
+
+CONCURRENT_CHILD = textwrap.dedent(
+    """
+    import sys
+    sys.path.insert(0, {repo!r})
+    from joule_agent.gpu_guard import GpuGuard, FakeGpuController
+
+    state_path, pid_tag = sys.argv[1], int(sys.argv[2])
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=state_path)
+    g.arm()
+    g.state.pid = pid_tag
+    for _ in range(60):
+        g._mark_touched()
+    """
+)
+
+
+def test_concurrent_processes_do_not_delete_each_others_records(tmp_path):
+    """N3: a shared `.tmp` name let one process rename another's file away.
+
+    That produced FileNotFoundError in os.replace and deleted records outright
+    -- strictly worse than the single-record clobbering the schema replaced.
+    """
+    repo = str(Path(__file__).resolve().parent.parent)
+    script = tmp_path / "conc.py"
+    script.write_text(CONCURRENT_CHILD.format(repo=repo))
+    sp = tmp_path / "state.json"
+
+    procs = [
+        subprocess.Popen(
+            [sys.executable, str(script), str(sp), str(2000 + i)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for i in range(6)
+    ]
+    errs = []
+    for pr in procs:
+        _, e = pr.communicate(timeout=90)
+        if pr.returncode != 0:
+            errs.append(e[-300:])
+    assert not errs, f"concurrent writers crashed: {errs[:2]}"
+
+    doc = json.loads(sp.read_text())
+    assert doc.get("schema") == 2
+    assert len(doc["guards"]) >= 1, "all records were destroyed"
+
+
+def test_recovery_does_not_clear_a_live_writers_record(tmp_path):
+    """N9: clearing a running process's record erases live evidence."""
+    sp = tmp_path / "state.json"
+    sp.write_text(json.dumps({
+        "schema": 2,
+        "guards": {
+            str(os.getppid()): {"pid": os.getppid(), "restored": False,
+                                "clocks_locked": True, "snapshot": {}},
+            "999999": {"pid": 999999, "restored": False,
+                       "clocks_locked": True, "snapshot": {}},
+        },
+    }))
+    c = FakeGpuController()
+    res = restore_from_state_file(c, sp)
+    doc = json.loads(sp.read_text())
+    assert doc["guards"]["999999"]["restored"] is True, "dead record not cleared"
+    assert doc["guards"][str(os.getppid())]["restored"] is False, \
+        "cleared a record belonging to a live process"
+    assert os.getppid() in res.get("skipped_live_pids", [])
+
+
+def test_claim_is_exclusive(tmp_path):
+    """N5: two guards must not silently share one controller."""
+    c = FakeGpuController()
+    c.claim("owner-a")
+    with pytest.raises(GpuGuardError, match="already claimed"):
+        c.claim("owner-b")
+    c.claim("owner-a")  # same owner is fine
+
+
+def test_status_flags_unreadable_power_rather_than_implying_clean(tmp_path):
+    """N11: a clean report must not be produced by a check that never ran."""
+    class Unreadable(FakeGpuController):
+        def get_power_limit_mw(self):
+            return None
+
+        def get_power_default_limit_mw(self):
+            return None
+
+    rep = check_stale_state(Unreadable(), tmp_path / "none.json")
+    assert rep["power_readable"] is False
+    assert any("UNKNOWN" in f for f in rep["findings"])

@@ -63,6 +63,12 @@ The comparison MUST include, as named baselines (not just "before/after"):
    - **Verification gate: lock EFFICACY still OPEN — and it blocks component 4 being meaningful.** NVML accepting `nvmlDeviceSetGpuLockedClocks` is not evidence the device honoured it; GeForce parts restrict some NVML writes. If the lock is a silent no-op here, every configuration in the static sweep would measure identically and the sweep would look like it ran while proving nothing. `tools/verify_clock_lock.py` settles it behaviourally: sustained load, SM clock sampled across baseline / locked / recovered phases. Unlocked baseline under load on this card is **1935–1950 MHz**, so a lock at 900 MHz is trivially distinguishable. Requires root; not yet run.
    - **Superseded note (unit evidence).** 32 tests cover exception/SIGINT/SIGTERM/SIGKILL paths using real child processes and a fake controller. Mutation-tested: disabling signal handlers makes the SIGTERM case fail, and reordering the state-file write makes the ordering test fail. Note the asymmetry — the **SIGINT** case still passes without handlers, because Python's default `KeyboardInterrupt` unwinds through `__exit__`; **SIGTERM is the case that isolates the handler**. The live on-GPU kill test requires root and has not yet been run.
 
+## Review gates
+- Any commit touching `gpu_guard.py`, `sweep.py`, or `controller.py`: run
+  hardware-safety-reviewer before committing.
+- Any numeric result or measured claim entering CLAUDE.md, `serve_flags.txt`,
+  or a report: run measurement-skeptic before recording it.
+
 ## Non-negotiable safety/honesty rules
 - Never claim a specific efficiency percentage in code comments, README, or CLI output that hasn't actually been measured in that run. No placeholder "20-30%" claims anywhere.
 - Report savings as a curve against p99 degradation, never a single point number in isolation.
