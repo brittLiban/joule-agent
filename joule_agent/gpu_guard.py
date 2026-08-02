@@ -363,7 +363,11 @@ class FakeGpuController(_ClaimMixin):
         power_limit_mw: int = 200_000,
         power_default_limit_mw: int = 200_000,
         fail_restore: bool = False,
+        index: int = 0,
+        uuid: str = "GPU-FAKE",
     ) -> None:
+        self._index = index
+        self._uuid = uuid
         self._power = power_limit_mw
         self._default = power_default_limit_mw
         self.locked: tuple | None = None
@@ -377,9 +381,9 @@ class FakeGpuController(_ClaimMixin):
 
     def snapshot(self) -> DeviceSnapshot:
         return DeviceSnapshot(
-            index=0,
+            index=self._index,
             name="FakeGPU",
-            uuid="GPU-FAKE",
+            uuid=self._uuid,
             power_limit_mw=self._power,
             power_default_limit_mw=self._default,
             power_min_mw=100_000,
@@ -552,14 +556,56 @@ def _read_record(path: Path) -> dict | None:
     return rec
 
 
-def _controller_index(controller) -> int | None:
+def _controller_identity(controller) -> tuple:
+    """Return ``(index, uuid)`` for the device a controller holds.
+
+    UUID is the authoritative half. Device *index* is an enumeration order, not
+    an identity: it can shift across a reboot, a driver reload, or a change to
+    CUDA_VISIBLE_DEVICES. A record written before such a change can name index 0
+    and mean a different physical card, so an index match is not proof and a
+    UUID mismatch overrides it.
+    """
     idx = getattr(controller, "_index", None)
-    if idx is not None:
-        return idx
+    uuid = None
     try:
-        return controller.snapshot().index
+        snap = controller.snapshot()
+        uuid = snap.uuid
+        if idx is None:
+            idx = snap.index
     except Exception:
-        return None
+        pass
+    return idx, uuid
+
+
+def _device_mismatch(record: dict, controller) -> str | None:
+    """Describe why `record` is not about `controller`'s device, or None.
+
+    Protected surface: every restore that applies a snapshot must pass this
+    first. Applying one device's stock values to another silently mis-caps the
+    wrong card and clears the right card's evidence.
+    """
+    idx, uuid = _controller_identity(controller)
+    rec_uuid = record.get("device_uuid")
+    rec_idx = record.get("device_index")
+    if uuid and rec_uuid and uuid != rec_uuid:
+        return (
+            f"the record is for device {rec_uuid} but this controller holds "
+            f"{uuid}"
+            + (
+                f" (both report index {idx}; the enumeration changed, so the "
+                "index is not proof of identity)"
+                if rec_idx == idx
+                else f" (record index {rec_idx}, controller index {idx})"
+            )
+        )
+    if uuid and rec_uuid and uuid == rec_uuid:
+        return None                     # UUID match is authoritative
+    if idx is not None and rec_idx is not None and rec_idx != idx:
+        return (
+            f"the record names GPU {rec_idx} but this controller holds GPU "
+            f"{idx} (no UUID recorded, so only the index could be compared)"
+        )
+    return None
 
 
 def _pid_alive(pid) -> bool:
@@ -965,7 +1011,7 @@ def check_stale_state(
     """
     path = Path(state_path)
     prior, status, extra = _load_state(path)
-    dev = _controller_index(controller)
+    dev, dev_uuid = _controller_identity(controller)
     report = {
         "state_file": str(path),
         "state_file_present": path.exists(),
@@ -1012,21 +1058,20 @@ def check_stale_state(
         )
 
     # Tier 2: assertion only -- the device cannot be asked about clock locks.
+    mismatch = _device_mismatch(prior, controller) if prior else None
     if prior is not None:
-        rec_dev = prior.get("device_index")
-        report["record_is_for_this_device"] = (
-            None if (dev is None or rec_dev is None) else rec_dev == dev
-        )
-    if prior and not prior.get("restored", True) and report["record_is_for_this_device"] is False:
+        report["record_device_uuid"] = prior.get("device_uuid")
+        report["record_is_for_this_device"] = mismatch is None
+    if prior and not prior.get("restored", True) and mismatch:
         # Tier 1 above describes the device this controller holds; this record
         # describes a different one. Saying "stale" without saying which device
         # would send an operator to reset the wrong GPU.
         report["stale"] = True
         report["findings"].append(
-            f"OTHER DEVICE (state file): the unrestored record names GPU "
-            f"{prior.get('device_index')}, but this report was produced against "
-            f"GPU {dev}. Nothing here is evidence about GPU {dev}'s clock lock. "
-            f"Re-run with --gpu {prior.get('device_index')}."
+            f"OTHER DEVICE (state file): {mismatch}. Nothing here is evidence "
+            f"about GPU {dev}'s clock lock, and recovery pointed at this device "
+            "would apply the other card's snapshot. Re-run with --gpu "
+            f"{prior.get('device_index')}."
         )
         report["recommendation"] = (
             "Run `sudo python -m joule_agent.gpu_guard restore --gpu "
@@ -1093,7 +1138,7 @@ def restore_from_state_file(
 ) -> dict:
     """Recovery path for after a hard kill. Unconditional and idempotent."""
     prior, status, extra = _load_state(state_path)
-    dev = _controller_index(controller)
+    dev, dev_uuid = _controller_identity(controller)
     result = {
         "reset_clocks": False,
         "power_restored_to_mw": None,
@@ -1127,15 +1172,17 @@ def restore_from_state_file(
     # A record for another GPU must not be applied to this one: the snapshot's
     # power value belongs to that device, and on a homogeneous node NVML will
     # accept it silently.
-    rec_dev = (prior or {}).get("device_index")
-    wrong_device = prior is not None and dev is not None and rec_dev is not None and rec_dev != dev
-    if wrong_device:
+    mismatch = _device_mismatch(prior, controller) if prior else None
+    if mismatch:
+        rec_dev = prior.get("device_index")
         result["incomplete"] = True
         result["record_device_index"] = rec_dev
+        result["record_device_uuid"] = prior.get("device_uuid")
         result["errors"].append(
-            f"the record names GPU {rec_dev} but recovery was pointed at GPU "
-            f"{dev}. Refusing to write that device's snapshot here or to clear "
-            f"its record. Re-run with --gpu {rec_dev}."
+            f"device identity mismatch: {mismatch}. Refusing to write that "
+            "device's snapshot here or to clear its record -- doing so would "
+            "mis-cap this card and destroy the other card's evidence. Re-run "
+            f"with --gpu {rec_dev}."
         )
         prior = None      # do not use it for power, do not clear it
 

@@ -62,3 +62,15 @@ VLLM_USE_FLASHINFER_SAMPLER=0
 # 5. Re-run verify_energy_agreement under varying load on that GPU. Sensor
 #    cadence and ring depth are per-device; so is counter trustworthiness.
 # 6. Re-check whether VLLM_USE_FLASHINFER_SAMPLER=0 is still needed.
+# 7. MULTI-GPU: if the node has more than one card, live-verify gpu_guard's
+#    device-identity gate. It has only ever run against the fake NVML layer.
+#      a. `gpu_guard --gpu 1 lock --mhz <x> --crash-after 3 ...` to strand a
+#         record for GPU 1.
+#      b. `gpu_guard --gpu 0 status`  -> must report OTHER DEVICE and
+#         recommend `--gpu 1`, NOT recommend a bare restore.
+#      c. `gpu_guard --gpu 0 restore` -> must refuse with a device-identity
+#         mismatch, leave GPU 0's power limit untouched, and leave GPU 1's
+#         record restored=false. Exit code 1.
+#      d. `gpu_guard --gpu 1 restore` -> must succeed and clear the record.
+#    If (c) mis-caps GPU 0 or clears the record, STOP: recovery is applying one
+#    card's snapshot to another and the sweep cannot be trusted on that node.

@@ -1175,3 +1175,98 @@ def test_failed_restore_then_new_guard_names_the_real_cause(tmp_path):
                  state_path=sp)
     with pytest.raises(GuardBusyError, match="FAILED its restore"):
         g.arm()
+
+
+# ---------------------------------------------------------------------------
+# multi-GPU identity -- protected surface
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_refuses_a_record_from_a_different_uuid(tmp_path):
+    """Two physical cards, simulated with the fake NVML layer.
+
+    A record written by GPU 1 must never be applied to GPU 0: the snapshot's
+    power value belongs to the other card, and on a homogeneous node it is
+    inside this card's constraints so NVML accepts it silently.
+    """
+    sp = tmp_path / "state.json"
+    gpu1 = FakeGpuController(index=1, uuid="GPU-1111",
+                             power_limit_mw=150_000, power_default_limit_mw=200_000)
+    gpu0 = FakeGpuController(index=0, uuid="GPU-0000",
+                             power_limit_mw=200_000, power_default_limit_mw=200_000)
+
+    # GPU 1 runs, caps power, and dies without restoring.
+    g1 = GpuGuard(gpu1, consent=True, require_root=False, state_path=sp)
+    g1.arm()
+    g1.set_power_limit_mw(120_000)
+    assert record(sp)["device_uuid"] == "GPU-1111"
+
+    res = restore_from_state_file(gpu0, sp)      # operator points at GPU 0
+
+    assert res["reset_clocks"] is True, "the local clock reset must still apply"
+    assert gpu0.get_power_limit_mw() == 200_000, "GPU 1's snapshot hit GPU 0"
+    assert res["incomplete"] is True
+    assert res["record_cleared"] is False
+    assert any("GPU-1111" in e for e in res["errors"])
+    assert record(sp)["restored"] is False, "GPU 1's evidence was destroyed"
+
+    # And pointed at the right card it works. A fresh controller, because
+    # recovery normally runs in a separate process after the writer died --
+    # the exclusive claim correctly refuses a controller a live guard holds.
+    gpu1_after = FakeGpuController(index=1, uuid="GPU-1111",
+                                   power_limit_mw=120_000,
+                                   power_default_limit_mw=200_000)
+    res2 = restore_from_state_file(gpu1_after, sp)
+    assert res2["errors"] == [], res2["errors"]
+    assert res2["record_cleared"] is True
+    assert gpu1_after.get_power_limit_mw() == 150_000, "restored to the wrong value"
+
+
+def test_uuid_mismatch_overrides_a_matching_index(tmp_path):
+    """Index is an enumeration order, not an identity.
+
+    After a reboot or a CUDA_VISIBLE_DEVICES change, index 0 can be a different
+    physical card. A record whose index matches but whose UUID does not must be
+    refused -- this is the case an index-only check cannot see.
+    """
+    sp = tmp_path / "state.json"
+    before = FakeGpuController(index=0, uuid="GPU-AAAA")
+    g = GpuGuard(before, consent=True, require_root=False, state_path=sp)
+    g.arm()
+    g.lock_clocks(1400)
+
+    after_reboot = FakeGpuController(index=0, uuid="GPU-BBBB")   # same index!
+    res = restore_from_state_file(after_reboot, sp)
+
+    assert res["incomplete"] is True
+    assert res["record_cleared"] is False
+    assert any("enumeration changed" in e for e in res["errors"])
+    assert record(sp)["restored"] is False
+
+
+def test_stale_check_reports_uuid_mismatch_and_the_right_gpu_flag(tmp_path):
+    sp = tmp_path / "state.json"
+    gpu1 = FakeGpuController(index=1, uuid="GPU-1111")
+    g = GpuGuard(gpu1, consent=True, require_root=False, state_path=sp)
+    g.arm()
+    g.lock_clocks(1400)
+
+    rep = check_stale_state(FakeGpuController(index=0, uuid="GPU-0000"), sp)
+    assert rep["record_is_for_this_device"] is False
+    assert rep["record_device_uuid"] == "GPU-1111"
+    assert any("OTHER DEVICE" in f for f in rep["findings"])
+    assert "--gpu 1" in rep["recommendation"]
+
+
+def test_matching_uuid_is_accepted_even_if_the_index_moved(tmp_path):
+    """The converse: the same card re-enumerated must still be recoverable."""
+    sp = tmp_path / "state.json"
+    was_1 = FakeGpuController(index=1, uuid="GPU-SAME")
+    g = GpuGuard(was_1, consent=True, require_root=False, state_path=sp)
+    g.arm()
+    g.lock_clocks(1400)
+
+    now_0 = FakeGpuController(index=0, uuid="GPU-SAME")   # same card, new index
+    res = restore_from_state_file(now_0, sp)
+    assert res["errors"] == []
+    assert res["record_cleared"] is True
