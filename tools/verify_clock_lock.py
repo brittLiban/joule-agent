@@ -109,6 +109,7 @@ def main(argv=None) -> int:
 
     print(f"phase 2/3: locked at {args.target_mhz} MHz", flush=True)
     controller = NvmlGpuController(index=0)
+    guard = None
     try:
         guard = GpuGuard(controller, consent=True)
         with guard:
@@ -119,7 +120,19 @@ def main(argv=None) -> int:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
     finally:
-        controller.close()
+        # Do NOT close while the guard still holds unrestored state. close()
+        # shuts NVML down, and the atexit last-chance restore would then fail
+        # against a dead handle -- turning a possible recovery into a certain
+        # failure. Same defect that gpu_guard.main() was fixed for; this is the
+        # other place that needed it.
+        if guard is not None and not guard._restored:
+            print(
+                "WARNING [verify_clock_lock]: guard state unrestored; leaving "
+                "NVML open so the exit-time restore can still run.",
+                file=sys.stderr,
+            )
+        else:
+            controller.close()
     results["phases"].append(locked)
     print(f"  {locked}", flush=True)
 

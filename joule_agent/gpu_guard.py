@@ -409,6 +409,10 @@ class GuardState:
 
 STATE_SCHEMA = 2
 
+#: Per-thread set of state-lock paths already held, so nested acquisition
+#: (signal handler re-entering a write) does not self-deadlock on flock.
+_HELD_STATE_LOCKS = threading.local()
+
 
 def _state_lock(path: Path):
     """Inter-process lock around the state file's read-modify-write.
@@ -429,8 +433,22 @@ def _state_lock(path: Path):
         def __init__(self, p):
             self.path = p.with_suffix(p.suffix + ".lock")
             self.fd = None
+            self.reentrant = False
 
         def __enter__(self):
+            # flock locks attach to the OPEN FILE DESCRIPTION, not the process:
+            # reacquiring on a fresh fd from a thread that already holds this
+            # lock blocks forever. That is reachable on the signal path -- a
+            # SIGINT during _mark_touched's state write runs the handler on the
+            # same thread, which re-enters _write_state_atomic. The outer holder
+            # already provides exclusion, so nested acquisition is a no-op.
+            key = str(self.path)
+            held = getattr(_HELD_STATE_LOCKS, "paths", None)
+            if held is None:
+                held = _HELD_STATE_LOCKS.paths = set()
+            if key in held:
+                self.reentrant = True
+                return self
             try:
                 import fcntl
             except ImportError:  # pragma: no cover - non-POSIX
@@ -444,6 +462,7 @@ def _state_lock(path: Path):
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 self.fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
                 fcntl.flock(self.fd, fcntl.LOCK_EX)
+                held.add(key)
             except OSError as exc:  # pragma: no cover - fs dependent
                 print(
                     f"WARNING [gpu_guard]: could not lock {self.path} ({exc}); "
@@ -456,6 +475,8 @@ def _state_lock(path: Path):
             return self
 
         def __exit__(self, *exc):
+            if self.reentrant:
+                return False    # the outer acquisition owns release
             if self.fd is not None:
                 try:
                     import fcntl
@@ -464,6 +485,9 @@ def _state_lock(path: Path):
                 finally:
                     os.close(self.fd)
                     self.fd = None
+                    held = getattr(_HELD_STATE_LOCKS, "paths", None)
+                    if held is not None:
+                        held.discard(str(self.path))
             return False
 
     return _Lock(path)
@@ -559,6 +583,13 @@ class GpuGuard:
         #: both starts and finishes inside the restore window -- a depth check
         #: alone would see 0 at entry and 0 at exit and miss it.
         self._write_gen = 0
+        #: Bumped every time a restore records success. The writer samples it
+        #: before recording intent and re-checks in its finally. Testing
+        #: `if self._restored:` alone tests a LEVEL: a restore that completed
+        #: entirely inside the write's window leaves _restored True and is
+        #: caught, but one that completes just after the writer's check is not.
+        #: Comparing the counter tests the EDGE instead.
+        self._restore_gen = 0
         self._armed = False
         self._restored = True
         self._prev_handlers: dict = {}
@@ -738,16 +769,18 @@ class GpuGuard:
             # the signal path must see "write in flight" for the whole window,
             # including the gap between recording intent and issuing the write.
             self._write_depth += 1
+            restore_gen_before = self._restore_gen
             try:
                 self._mark_touched()
                 self._c.set_locked_clocks(min_mhz, max_mhz)
             finally:
                 self._write_depth -= 1
+                raced = self._restore_gen != restore_gen_before
                 # A signal handler can run BETWEEN _mark_touched() and the line
                 # above, re-enter restore() through the RLock, mark everything
                 # clean, and then let this frame resume and apply the lock. Any
                 # restore that overlapped this window is void.
-                if self._restored:
+                if self._restored or raced:
                     self._restored = False
                     if self.state is not None:
                         self.state.restored = False
@@ -779,12 +812,14 @@ class GpuGuard:
             # the signal path must see "write in flight" for the whole window,
             # including the gap between recording intent and issuing the write.
             self._write_depth += 1
+            restore_gen_before = self._restore_gen
             try:
                 self._mark_touched()
                 self._c.set_power_limit_mw(int(milliwatts))
             finally:
                 self._write_depth -= 1
-                if self._restored:
+                raced = self._restore_gen != restore_gen_before
+                if self._restored or raced:
                     self._restored = False
                     if self.state is not None:
                         self.state.restored = False
@@ -896,6 +931,7 @@ class GpuGuard:
                 return
 
             self._restored = True
+            self._restore_gen += 1
             if self.state is not None:
                 self.state.restored = True
                 self.state.restore_failed = False
@@ -1045,9 +1081,26 @@ def restore_from_state_file(
 ) -> dict:
     """Recovery path for after a hard kill. Unconditional and idempotent."""
     doc = _read_doc(Path(state_path))
-    records = list(doc.get("guards", {}).values())
+    all_records = list(doc.get("guards", {}).values())
+    # Only act on records for the device we are actually resetting. Clearing a
+    # record that names another GPU would erase evidence for a device this call
+    # never touched -- and clock-lock evidence has no device readback to rebuild
+    # it from.
+    dev = getattr(controller, "_index", None)
+    if dev is None:
+        try:
+            dev = controller.snapshot().index
+        except Exception:
+            dev = None
+    records = [
+        r for r in all_records
+        if dev is None or r.get("device_index") in (None, dev)
+    ]
     result = {"reset_clocks": False, "power_restored_to_mw": None,
               "records_cleared": 0, "errors": []}
+    skipped_other_device = len(all_records) - len(records)
+    if skipped_other_device:
+        result["skipped_other_device_records"] = skipped_other_device
 
     claim = getattr(controller, "claim", None)
     if callable(claim):
@@ -1075,6 +1128,13 @@ def restore_from_state_file(
         # default because it cannot distinguish our cap from a deliberate one.
         target = controller.get_power_default_limit_mw()
         result["power_forced_to_default"] = True
+    if target is None and wrote_power and not force_power_default:
+        result["errors"].append(
+            "a record shows this repo changed the power limit, but no restore "
+            "target is recoverable from its snapshot; the cap is still in "
+            "effect. Re-run with --force-power-default to reset to the device "
+            "default."
+        )
     if target is None and not wrote_power:
         result["power_untouched_reason"] = (
             "no state record shows this repo changed the power limit; leaving it "
@@ -1103,11 +1163,20 @@ def restore_from_state_file(
             rec["_recovered_by"] = "restore_from_state_file"
             result["records_cleared"] += 1
         try:
-            # Same read-modify-write hazard as _write_state_atomic: `doc` was
-            # read earlier in this function, so a guard writing meanwhile would
-            # be clobbered without the lock.
+            # Re-read INSIDE the lock. `doc` was read before the NVML calls
+            # above, so publishing it would clobber any guard that recorded
+            # intent during that window -- locking only the write leaves the
+            # stale half of the read-modify-write unprotected.
             with _state_lock(Path(state_path)):
-                _write_doc_atomic(Path(state_path), doc)
+                fresh = _read_doc(Path(state_path))
+                fresh.setdefault("guards", {})
+                for pid_key, rec in doc.get("guards", {}).items():
+                    if rec.get("restored"):
+                        # Only publish records THIS recovery cleared; leave any
+                        # record that appeared meanwhile exactly as we found it.
+                        fresh["guards"][pid_key] = rec
+                fresh["schema"] = STATE_SCHEMA
+                _write_doc_atomic(Path(state_path), fresh)
         except Exception as exc:
             result["errors"].append(f"state_file: {exc}")
     return result

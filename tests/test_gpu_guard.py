@@ -902,14 +902,36 @@ def test_restore_racing_a_write_on_another_thread_does_not_report_clean(tmp_path
     assert check_stale_state(FakeGpuController(), sp)["stale"] is True
 
 
-def test_write_depth_is_actually_read(tmp_path):
-    """V2: the counter was incremented and decremented but never consulted."""
-    import inspect
-    from joule_agent import gpu_guard as gg
+def test_write_gen_clause_catches_a_write_inside_the_restore_window(tmp_path):
+    """Isolates the _write_gen clause specifically.
 
-    src = inspect.getsource(gg.GpuGuard._restore_impl)
-    assert "_write_depth" in src, "_restore_impl ignores the in-flight counter"
-    assert "_write_gen" in src, "_restore_impl ignores the write generation"
+    depth_at_entry cannot catch a write that both STARTS and FINISHES inside
+    the restore window -- depth is 0 at entry and 0 at exit. Only the
+    generation comparison sees it. The source-text assertion this replaces was
+    satisfied by _restore_impl's own docstring and could not fail.
+    """
+    sp = tmp_path / "state.json"
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+    g.arm()
+
+    fired = {"n": 0}
+    real_reset = c.reset_locked_clocks
+
+    def reset_then_write():
+        real_reset()
+        if fired["n"] == 0:
+            fired["n"] = 1
+            # A whole write begins and completes here, inside the restore.
+            g.lock_clocks(1400)
+
+    c.reset_locked_clocks = reset_then_write
+    g._mark_touched()          # make the guard dirty so restore proceeds
+    g._restore_impl()
+
+    assert c.locked == (1400, 1400), "precondition: the nested write landed"
+    assert g._restored is False, "restore marked clean over a completed write"
+    assert record(sp)["restored"] is False
 
 
 def test_signal_path_does_not_block_behind_a_held_lock(tmp_path, monkeypatch):
@@ -1006,27 +1028,135 @@ def test_state_tmp_name_is_unique_per_thread(tmp_path):
     assert len(names) == len(set(names)), f"tmp name collision across threads: {names}"
 
 
-def test_main_does_not_close_nvml_while_state_is_unrestored(tmp_path):
-    """N6: closing in `finally` before atexit turns a possible last-chance
-    restore into a guaranteed failure against a dead NVML handle."""
+def test_main_does_not_close_nvml_while_state_is_unrestored(tmp_path, monkeypatch):
+    """N6, behavioural. The previous version asserted literal source
+    indentation and stayed green when the condition was inverted."""
     import joule_agent.gpu_guard as gg
-    import inspect
 
-    src = inspect.getsource(gg.main)
-    assert "_active_guard" in src
-    assert "c.close()" in src
-    # the close must be conditional, not unconditional in `finally`
-    assert "else:\n            c.close()" in src, "close is unconditional again"
+    class Unrestorable(FakeGpuController):
+        def reset_locked_clocks(self):
+            self._require_claim()
+            self.reset_calls += 1
+            raise RuntimeError("reset refused")
+
+    c = Unrestorable()
+    monkeypatch.setattr(gg, "_controller", lambda args: c)
+    monkeypatch.setattr(gg.os, "geteuid", lambda: 0)   # bypass privilege gate
+
+    rc = gg.main([
+        "--state-path", str(tmp_path / "s.json"),
+        "lock", "--mhz", "1400", "--hold", "0",
+        CONSENT_FLAG,
+    ])
+    assert c.closed is False, (
+        "NVML was closed while the guard held unrestored state; the atexit "
+        "last-chance restore can no longer run"
+    )
+    assert rc != 0
 
 
 def test_nvml_controller_claim_is_exclusive():
-    """The exclusive-claim test previously covered only the fake."""
+    """Uses a RUNTIME-CONSTRUCTED string so constant folding cannot make
+    `is` succeed -- the interning that made the previous version blind to a
+    reverted `_same_owner`."""
     from joule_agent.gpu_guard import NvmlGpuController
+
+    owner = "".join(["own", "er-a"])          # equal to "owner-a", not identical
+    assert owner == "owner-a" and owner is not "owner-a"  # noqa: F632
 
     c = object.__new__(NvmlGpuController)
     c._claimed_by = None
     c._closed = False
     c.claim("owner-a")
-    c.claim("owner-a")                      # same owner is fine
+    c.claim(owner)                             # equality must be enough
     with pytest.raises(GpuGuardError, match="already claimed"):
         c.claim("owner-b")
+
+
+def test_state_lock_never_blocks_on_a_lock_this_thread_holds(tmp_path, monkeypatch):
+    """flock attaches to the OPEN FILE DESCRIPTION, not the process.
+
+    _state_lock opens a fresh fd per acquisition, so a nested acquisition on
+    the same thread blocks forever unless it is made reentrant. That is
+    reachable on the signal path: a SIGINT during _mark_touched's state write
+    runs the handler on the same thread, which re-enters _write_state_atomic.
+    The result is a HANG on the Ctrl+C path -- the exact path the guard exists
+    to protect.
+
+    Asserts the second blocking flock is never ATTEMPTED, rather than
+    attempting it and timing out: a test that reproduces a deadlock wedges the
+    suite instead of failing it.
+    """
+    import fcntl
+
+    import joule_agent.gpu_guard as gg
+
+    ex_calls = []
+    real_flock = fcntl.flock
+
+    def counting_flock(fd, op):
+        if op & fcntl.LOCK_EX:
+            if ex_calls:
+                # Performing this would block forever on the lock this thread
+                # already holds -- which would wedge the suite instead of
+                # failing it. Refuse, so a regression surfaces as a fast error.
+                raise RuntimeError(
+                    "second blocking flock attempted while this thread already "
+                    "holds the state lock: this would deadlock"
+                )
+            ex_calls.append(fd)
+        elif op & fcntl.LOCK_UN and fd in ex_calls:
+            ex_calls.remove(fd)
+            ex_calls.append(fd)  # keep the count for the assertion
+        return real_flock(fd, op)
+
+    monkeypatch.setattr(fcntl, "flock", counting_flock)
+
+    sp = tmp_path / "state.json"
+    with gg._state_lock(sp) as outer:
+        assert outer.reentrant is False
+        with gg._state_lock(sp) as inner:
+            assert inner.reentrant is True, "nested acquisition was not reentrant"
+            assert inner.fd is None, "nested acquisition opened a second fd"
+    assert len(ex_calls) == 1, (
+        f"took {len(ex_calls)} exclusive flocks for a nested acquisition; the "
+        "second would block forever on the first"
+    )
+
+
+def test_state_write_reentered_under_a_held_lock_completes(tmp_path, monkeypatch):
+    """End-to-end form: a state write re-entered while this thread already
+    holds the state lock must complete, not block."""
+    import fcntl
+
+    import joule_agent.gpu_guard as gg
+
+    ex_calls = []
+    real_flock = fcntl.flock
+
+    def counting_flock(fd, op):
+        if op & fcntl.LOCK_EX:
+            if ex_calls:
+                # Performing this would block forever on the lock this thread
+                # already holds -- which would wedge the suite instead of
+                # failing it. Refuse, so a regression surfaces as a fast error.
+                raise RuntimeError(
+                    "second blocking flock attempted while this thread already "
+                    "holds the state lock: this would deadlock"
+                )
+            ex_calls.append(fd)
+        elif op & fcntl.LOCK_UN and fd in ex_calls:
+            ex_calls.remove(fd)
+            ex_calls.append(fd)  # keep the count for the assertion
+        return real_flock(fd, op)
+
+    monkeypatch.setattr(fcntl, "flock", counting_flock)
+
+    sp = tmp_path / "state.json"
+    c = FakeGpuController()
+    g = GpuGuard(c, consent=True, require_root=False, state_path=sp)
+    g.arm()
+    with gg._state_lock(sp):
+        g._mark_touched()               # re-enters _write_state_atomic
+    assert len(ex_calls) == 1, "the nested state write took a second flock"
+    assert record(sp)["restored"] is False
