@@ -61,14 +61,28 @@ def run(args, state, timeout=90, **kw):
 
 
 def check(name, cond, detail=""):
+    """Record a check. `detail` prints on PASS as well as FAIL, deliberately.
+
+    A run whose numbers are only visible when something breaks cannot be
+    audited: a reader cannot tell a capped 900 MHz from a silently-dead load
+    reading 210 MHz, because both satisfy the same assertion.
+    """
     (PASS if cond else FAIL).append(name)
-    print(f"  {'ok  ' if cond else 'FAIL'}  {name}" + (f"\n          {detail}" if detail and not cond else ""))
+    print(f"  {'ok  ' if cond else 'FAIL'}  {name}"
+          + (f"\n          {detail}" if detail else ""))
     return cond
 
 
-def skip(name, why):
-    SKIP.append(name)
-    print(f"  skip  {name}\n          {why}")
+def skip(name, why, covers=1):
+    """Record a skip. `covers` is how many checks did NOT run.
+
+    One skip() guarding a branch of three checks reported "1 skipped" and hid
+    two. A tally that undercounts what was not run is the same error as a
+    check that cannot fail.
+    """
+    SKIP.extend([name] * covers)
+    print(f"  skip  {name}" + (f" ({covers} checks)" if covers > 1 else "")
+          + f"\n          {why}")
 
 
 def read_record(state):
@@ -82,8 +96,37 @@ LOCKED_CEILING = 1000
 UNLOCKED_FLOOR = 1200
 
 
-def clock_under_load(seconds=5.0):
-    """Peak SM clock while the GPU is actually being driven.
+class Measurement:
+    """A clock measurement that knows whether it is trustworthy.
+
+    `peak` alone cannot be believed. If the synthetic load never ran, sampling
+    an idle card returns ~210 MHz -- which satisfies "the lock capped the
+    clock" just as well as a real 900 MHz cap does, so the check that exists to
+    stop a release-test passing against a never-locked card would itself pass
+    vacuously. Carry the load's exit status and the valid-sample count, and
+    treat a bad measurement as an error rather than as a number.
+    """
+
+    def __init__(self, samples, load_rc):
+        self.samples = sorted(s for s in samples if s)
+        self.load_rc = load_rc
+        self.n = len(self.samples)
+        self.peak = self.samples[-1] if self.samples else 0
+        self.median = self.samples[self.n // 2] if self.samples else 0
+
+    @property
+    def usable(self):
+        """Trustworthy only if the load really ran AND we really sampled."""
+        return self.load_rc == 0 and self.n >= 10
+
+    def __str__(self):
+        return (f"peak {self.peak} MHz, median {self.median} MHz, "
+                f"{self.n} samples, load rc={self.load_rc}"
+                + ("" if self.usable else "  <-- UNUSABLE"))
+
+
+def clock_under_load(seconds=6.0):
+    """Sample the SM clock while the GPU is actually being driven.
 
     **The idle clock is not a probe for a clock lock, and using it as one is a
     claim without evidence.** An idle card sits at ~210 MHz whether or not a
@@ -95,29 +138,59 @@ def clock_under_load(seconds=5.0):
     value.
 
     This driver exposes no `nvmlDeviceGetGpuLockedClocks`. The only way to
-    observe a lock is to demand clocks and see whether they are capped, which
-    is what `tools/verify_clock_lock.py` does and what this now does too.
+    observe a lock is to demand clocks and see whether they are capped.
     """
-    proc = subprocess.Popen(
-        [PY, str(REPO / "tools/synthetic_gpu_load.py"),
-         "--duration", str(seconds + 3), "--period", str(seconds + 3),
-         "--duty", "1.0"],
-        cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    peak = 0
     try:
+        proc = subprocess.Popen(
+            [PY, str(REPO / "tools/synthetic_gpu_load.py"),
+             "--duration", str(seconds + 3), "--period", str(seconds + 3),
+             "--duty", "1.0"],
+            cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        # The load could not even start. Return an UNUSABLE measurement rather
+        # than raising: every caller already treats unusable as a failed check,
+        # and a raise here would abort the run half-finished with the card
+        # possibly still locked.
+        return Measurement([], f"could not start: {exc}")
+    samples = []
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
         time.sleep(2.0)                       # let the clocks ramp
         end = time.time() + seconds
         while time.time() < end:
-            v = sm_clock()
-            if v:
-                peak = max(peak, v)
-            time.sleep(0.25)
+            try:
+                samples.append(
+                    pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_SM))
+            except Exception:
+                pass
+            time.sleep(0.1)
+        pynvml.nvmlShutdown()
+    except Exception:
+        pass
     finally:
         try:
-            proc.wait(timeout=30)
+            rc = proc.wait(timeout=30)
         except subprocess.TimeoutExpired:
             proc.kill()
-    return peak
+            rc = -1
+    return Measurement(samples, rc)
+
+
+def capped(m, name):
+    """The lock is holding: NO sample may exceed the ceiling (strong form)."""
+    return check(name, m.usable and m.peak <= LOCKED_CEILING, str(m))
+
+
+def released(m, name):
+    """The lock is gone: the MEDIAN must clear the floor.
+
+    Not the peak. `peak >= floor` is satisfied by a single spurious sample,
+    and these are the claim's central assertions -- they should not use the
+    statistic that is easiest to satisfy by accident.
+    """
+    return check(name, m.usable and m.median >= UNLOCKED_FLOOR, str(m))
 
 
 def sm_clock():
@@ -131,6 +204,34 @@ def sm_clock():
         return v
     except Exception:
         return None
+
+
+def device_provenance():
+    """Name the hardware in the transcript rather than relying on the operator.
+
+    A result recorded as "on the 3060 Ti, driver 595.71.05" is only as good as
+    whoever typed that afterwards. Print it from the device.
+    """
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        h = pynvml.nvmlDeviceGetHandleByIndex(0)
+        def txt(v):
+            return v.decode() if isinstance(v, bytes) else str(v)
+        parts = [
+            txt(pynvml.nvmlDeviceGetName(h)),
+            f"uuid {txt(pynvml.nvmlDeviceGetUUID(h))}",
+            f"driver {txt(pynvml.nvmlSystemGetDriverVersion())}",
+        ]
+        try:
+            mode = pynvml.nvmlDeviceGetPersistenceMode(h)
+            parts.append(f"persistence {'on' if mode else 'off'}")
+        except Exception:
+            parts.append("persistence unreadable")
+        pynvml.nvmlShutdown()
+        return " | ".join(parts)
+    except Exception as exc:
+        return f"device provenance UNREADABLE ({type(exc).__name__}: {exc})"
 
 
 # ---------------------------------------------------------------------------
@@ -149,37 +250,45 @@ def unprivileged(tmp):
     except Exception:
         rep = {}
     check("status runs unprivileged and emits JSON", ok and bool(rep),
-          f"rc={r.returncode} {r.stdout[:200]!r}")
+          f"rc={r.returncode}, {len(rep)} fields")
     check("status needs no consent flag and reads the device",
-          rep.get("power_readable") is True, f"{rep!r}")
+          rep.get("power_readable") is True,
+          f"power_readable={rep.get('power_readable')}")
     check("status leaves no state file", not s.exists())
 
     s = tmp / "b.json"
     r = run(["lock", "--mhz", "900", "--hold", "1"], s)
     check("lock without consent exits 2", r.returncode == 2, f"rc={r.returncode}")
-    check("...and names the consent flag", CONSENT in r.stderr, r.stderr[:200])
+    check("...and names the consent flag", CONSENT in r.stderr,
+          "message names the flag" if CONSENT in r.stderr else r.stderr[:200])
     check("...and publishes NO claim", not s.exists(),
-          "a caller that was never allowed to write left a record")
+          f"state file present: {s.exists()}")
 
     s = tmp / "c.json"
     r = run(["lock", "--mhz", "100", "--hold", "1", CONSENT], s)
     check("lock below the floor exits 2", r.returncode == 2, f"rc={r.returncode}")
-    check("...and refuses rather than clamping",
-          "NOT clamped" in r.stderr, r.stderr[:200])
+    check("...and refuses rather than clamping", "NOT clamped" in r.stderr,
+          "message says NOT clamped" if "NOT clamped" in r.stderr else r.stderr[:200])
     check("...and publishes NO claim", not s.exists(),
-          "a refused clock value left a record")
+          f"state file present: {s.exists()}")
 
-    s = tmp / "d.json"
-    r = run(["lock", "--mhz", "900", "--hold", "1", CONSENT], s)
     if os.geteuid() == 0:
-        skip("lock without root fails loudly", "running as root")
+        # Do NOT run it. As root this is a real lock-and-restore cycle whose
+        # result is then discarded -- an unasserted GPU write inside the
+        # section labelled "no root needed", moments before the kill tests
+        # take their unlocked baseline.
+        skip("lock without root fails loudly",
+             "running as root; the privilege refusal cannot be exercised here",
+             covers=3)
     else:
+        s = tmp / "d.json"
+        r = run(["lock", "--mhz", "900", "--hold", "1", CONSENT], s)
         check("lock without root exits 2", r.returncode == 2, f"rc={r.returncode}")
         check("...and says so rather than no-oping",
               "require root" in r.stderr, r.stderr[:200])
         check("...and any record it left is settled",
               (not s.exists()) or read_record(s)["restored"] is True,
-              "a privilege refusal stranded an unrestored record")
+              f"restored={read_record(s)['restored'] if s.exists() else 'no file'}")
 
     # A stale record for ANOTHER device must not send the operator at this one.
     s = tmp / "e.json"
@@ -195,7 +304,8 @@ def unprivileged(tmp):
     check("a record for another card is reported stale", r.returncode == 1,
           f"rc={r.returncode}")
     check("...and is not claimed to be about this device",
-          rep.get("record_is_for_this_device") is False, f"{rep!r}")
+          rep.get("record_is_for_this_device") is False,
+          f"record_is_for_this_device={rep.get('record_is_for_this_device')}")
     check("...and the recommendation names the recorded GPU",
           "--gpu 1" in (rep.get("recommendation") or ""),
           f"{rep.get('recommendation')!r}")
@@ -207,14 +317,16 @@ def unprivileged(tmp):
     check("an uninterpretable record is stale, not clean", r.returncode == 1,
           f"rc={r.returncode}")
     check("...and is labelled UNREADABLE rather than guessed",
-          any("UNREADABLE" in f for f in rep.get("findings", [])), f"{rep!r}")
+          any("UNREADABLE" in f for f in rep.get("findings", [])),
+          "; ".join(f.split(":")[0] for f in rep.get("findings", [])) or "no findings")
     check("...and status did not overwrite it",
-          s.read_text() == "{ this is not json", "status destroyed evidence")
+          s.read_text() == "{ this is not json",
+          f"file on disk: {s.read_text()!r}")
 
     r = run(["--gpu", "99", "status"], tmp / "g.json")
     check("a nonexistent device fails cleanly, not with a traceback",
           r.returncode != 0 and "Traceback" not in r.stderr,
-          f"rc={r.returncode} {r.stderr[-300:]!r}")
+          f"rc={r.returncode}, traceback={'Traceback' in r.stderr}")
 
 
 # ---------------------------------------------------------------------------
@@ -226,14 +338,17 @@ def kill_tests(tmp):
     print("\n-- kill tests (real clock writes, verified under load) --")
     idle = sm_clock()
     if idle is None:
-        skip("all kill tests", "could not read the SM clock from NVML")
+        skip("all kill tests", "could not read the SM clock from NVML", covers=20)
         return
     base = clock_under_load()
-    print(f"          idle {idle} MHz; peak under load {base} MHz")
-    if not check("the card is unlocked before we start", base >= UNLOCKED_FLOOR,
-                 f"peak {base} MHz -- something already holds a lock; run "
-                 f"`sudo python -m joule_agent.gpu_guard restore` first"):
-        skip("remaining kill tests", "cannot measure against a locked baseline")
+    print(f"          idle {idle} MHz; unlocked baseline: {base}")
+    if not check("the card is unlocked before we start (harness precondition, "
+                 "not a gpu_guard property)",
+                 base.usable and base.median >= UNLOCKED_FLOOR, str(base)):
+        skip("remaining kill tests",
+             "cannot measure against a baseline that is not stock; run "
+             "`sudo .venv/bin/python -m joule_agent.gpu_guard restore` first",
+             covers=19)
         return
 
     def lock_proc(state, hold, extra=()):
@@ -245,26 +360,23 @@ def kill_tests(tmp):
 
     # 1. clean exit
     s = tmp / "k1.json"
-    p = lock_proc(s, 25)
-    held = clock_under_load()
+    p = lock_proc(s, 30)
+    capped(clock_under_load(), "clean run: the lock really caps the clock")
     rc = p.wait(timeout=120)
-    check("clean run: the lock really caps the clock", held <= LOCKED_CEILING,
-          f"peak {held} MHz under load with a 900 MHz lock applied")
     check("clean run exits 0", rc == 0, f"rc={rc} {p.stderr.read()[-300:]!r}")
     check("clean run: the record ends settled",
-          s.exists() and read_record(s)["restored"] is True)
-    after = clock_under_load()
-    check("clean run: the clock is released", after >= UNLOCKED_FLOOR,
-          f"peak {after} MHz -- GPU LEFT MODIFIED")
+          s.exists() and read_record(s)["restored"] is True,
+          f"restored={read_record(s)['restored'] if s.exists() else 'no file'}")
+    released(clock_under_load(), "clean run: the clock is released")
 
     # 2/3. SIGINT and SIGTERM mid-lock
     for signame, signum in (("SIGINT", signal.SIGINT), ("SIGTERM", signal.SIGTERM)):
         s = tmp / f"k-{signame}.json"
-        p = lock_proc(s, 120)
-        held = clock_under_load()
-        check(f"{signame}: the lock was applied first", held <= LOCKED_CEILING,
-              f"peak {held} MHz -- the lock never took effect, so the rest "
-              f"proves nothing")
+        p = lock_proc(s, 150)
+        # Measured BEFORE the release check, so a release cannot pass against a
+        # card that was never locked -- provided the load really ran, which
+        # Measurement.usable is what establishes.
+        capped(clock_under_load(), f"{signame}: the lock was applied first")
         p.send_signal(signum)
         try:
             p.wait(timeout=60)
@@ -272,24 +384,18 @@ def kill_tests(tmp):
             p.kill()
             check(f"{signame} terminates the run", False, "still running after 60s")
             continue
-        after = clock_under_load()
-        check(f"{signame}: the clock is restored", after >= UNLOCKED_FLOOR,
-              f"peak {after} MHz -- GPU LEFT MODIFIED")
+        released(clock_under_load(), f"{signame}: the clock is restored")
         check(f"{signame}: the record ends settled",
               s.exists() and read_record(s)["restored"] is True,
-              f"{read_record(s) if s.exists() else 'no file'}")
+              f"restored={read_record(s)['restored'] if s.exists() else 'no file'}")
 
     # 4. SIGKILL, then recover
     s = tmp / "k4.json"
-    r = run(["lock", "--mhz", "900", "--hold", "120", "--crash-after", "6", CONSENT],
+    r = run(["lock", "--mhz", "900", "--hold", "150", "--crash-after", "6", CONSENT],
             s, timeout=180)
     check("SIGKILL: the process really died by signal", r.returncode == -signal.SIGKILL,
           f"rc={r.returncode}")
-    killed = clock_under_load()
-    check("SIGKILL: the GPU is left modified, as expected",
-          killed <= LOCKED_CEILING,
-          f"peak {killed} MHz -- nothing was left to recover, so the recovery "
-          f"checks below prove nothing")
+    capped(clock_under_load(), "SIGKILL: the GPU is left modified, as expected")
     check("SIGKILL: the record survives saying so",
           s.exists() and read_record(s)["restored"] is False
           and read_record(s)["clocks_locked"] is True,
@@ -299,18 +405,20 @@ def kill_tests(tmp):
     check("SIGKILL: status reports it stale", r.returncode == 1, f"rc={r.returncode}")
 
     r = run(["restore"], s, timeout=120)
-    check("recovery exits 0", r.returncode == 0, f"{r.stdout!r} {r.stderr!r}")
-    recovered = clock_under_load()
-    check("recovery released the clock", recovered >= UNLOCKED_FLOOR,
-          f"peak {recovered} MHz -- RECOVERY FAILED, GPU STILL LOCKED")
+    check("recovery exits 0", r.returncode == 0, f"rc={r.returncode}")
+    released(clock_under_load(), "recovery released the clock")
     check("recovery cleared the record",
-          read_record(s)["restored"] is True, f"{read_record(s)}")
+          read_record(s)["restored"] is True,
+          f"restored={read_record(s)['restored']}")
 
     r = run(["status"], s)
     check("status is clean afterwards", r.returncode == 0, f"rc={r.returncode}")
 
     r = run(["restore"], s, timeout=120)
-    check("recovery is idempotent", r.returncode == 0, f"rc={r.returncode}")
+    check("recovery is idempotent (exit code)", r.returncode == 0, f"rc={r.returncode}")
+    # ...and in hardware. Exiting 0 twice says nothing about what the second
+    # run did to the device; a re-lock would still exit 0.
+    released(clock_under_load(), "recovery is idempotent (the card is still free)")
 
 
 def main():
@@ -320,16 +428,20 @@ def main():
     args = ap.parse_args()
 
     print(f"gpu_guard CLI contract check -- uid {os.geteuid()}")
+    print("  " + device_provenance())
     with tempfile.TemporaryDirectory(prefix="gpu-guard-cli-") as d:
         tmp = Path(d)
         unprivileged(tmp)
         if args.root:
             if os.geteuid() != 0:
-                skip("kill tests", "--root given but not running as root")
+                skip("kill tests", "--root given but not running as root",
+                     covers=20)
             else:
                 kill_tests(tmp)
         else:
-            skip("kill tests", "re-run with sudo and --root to exercise real writes")
+            skip("kill tests",
+                 "re-run with sudo and --root to exercise real writes",
+                 covers=20)
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed, {len(SKIP)} skipped")
     for f in FAIL:
