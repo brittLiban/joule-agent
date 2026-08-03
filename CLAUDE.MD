@@ -135,6 +135,14 @@ that cannot fail proves nothing about the code.
 the test is sound. Confirm separately that each assertion CAN be false, and
 that the mutation used breaks the specific property named.
 
+**This method now has an owner: `.claude/agents/test-integrity-auditor.md`.** It
+was improvised once, under pressure, and found six tests certifying nothing --
+one of which named the exact property it failed to pin. Component 4 is where
+tests start guarding *results* rather than hardware state, and a vacuous test
+there is a benchmark number nobody can trust. Report-only, like the other two
+critics; it mutates source to do its work, so it restores what it touches and
+reports the tree clean.
+
 ## Final pass: the contract, and what is accepted around it
 
 The bar for the last pass was not "zero findings" but **the two contract
@@ -245,6 +253,12 @@ after that would be against a baseline that is not stock.
   signal to stop and ask, not to build it.
 - Any numeric result or measured claim entering CLAUDE.md, `serve_flags.txt`,
   or a report: run measurement-skeptic before recording it.
+- Before any measured result is recorded as evidence: run test-integrity-auditor
+  on the tests that result depends on, then measurement-skeptic on the claim.
+  That order matters -- the skeptic asks whether the evidence supports the
+  claim, and the auditor asks whether the tests producing that evidence pin
+  anything at all. A clean skeptic pass over a suite that certifies nothing is
+  the shape of the `7700b0f` failure, one layer further out.
 
 ## Non-negotiable safety/honesty rules
 - Never claim a specific efficiency percentage in code comments, README, or CLI output that hasn't actually been measured in that run. No placeholder "20-30%" claims anywhere.
