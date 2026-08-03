@@ -206,6 +206,25 @@ into `main()` or `NvmlGpuController`, so none of it was reachable there.
 The rule that follows: **every refusal depending only on the arguments or the
 caller — never on the device — must happen before the guard is entered.**
 
+**The first version of that tool reported four false failures, and the bug was
+the project's signature error in my own instrument.** It read
+`nvmlDeviceGetClockInfo` and treated the *current* SM clock as a proxy for "is a
+lock applied". It is not: an idle card sits at ~210 MHz whether or not it is
+locked, and a card locked at [900, 900] sits at 900 when idle too. So the tool
+reported **"GPU LEFT MODIFIED, still at 210 MHz"** — 210 MHz being precisely the
+unlocked-idle value — and would equally have passed a card that was still
+locked. A claim recorded without evidence supporting it, one layer further out
+than the last one.
+
+This driver exposes no `nvmlDeviceGetGpuLockedClocks`; the module says so and
+builds its whole two-tier stale-detection around it. The only sound probe is to
+**demand clocks and see whether they are capped**, which `verify_clock_lock.py`
+already did and `cli_contract_check.py` now does: drive the synthetic load, take
+the peak SM clock, and compare against a locked ceiling (1000 MHz) and an
+unlocked floor (1200 MHz) with a wide dead band between them. The kill tests now
+also refuse to start if the card is already locked, since every measurement
+after that would be against a baseline that is not stock.
+
 ## Review gates
 - Any commit touching `gpu_guard.py`, `sweep.py`, or `controller.py`: run
   hardware-safety-reviewer before committing.

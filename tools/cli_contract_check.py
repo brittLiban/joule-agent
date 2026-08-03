@@ -15,13 +15,23 @@ code, message content, and what the run left on disk.
 
 Running it
 ----------
-    python tools/cli_contract_check.py           # unprivileged half
-    sudo -E .venv/bin/python tools/cli_contract_check.py --root
+    .venv/bin/python tools/cli_contract_check.py            # unprivileged half
+    sudo .venv/bin/python tools/cli_contract_check.py --root
+
+(Use the venv interpreter explicitly. ``sudo -E`` is ignored on this system and
+plain ``sudo python`` picks up the system interpreter, which has no pynvml.)
 
 Unprivileged, it verifies every refusal path and that no refusal leaves a claim
-behind. With ``--root`` it additionally runs the kill tests: clean exit, SIGINT,
-SIGTERM, and SIGKILL-then-recover, checking the real clock actually moved and
-came back. Nothing here is skipped silently -- a check that cannot run says so.
+behind. With ``--root`` it additionally runs the kill tests -- clean exit,
+SIGINT, SIGTERM, and SIGKILL-then-recover -- **verifying the lock under load**,
+not by reading the idle clock. See ``clock_under_load``: an idle card reads
+~210 MHz whether or not it is locked, so a bare clock read cannot tell
+"restored" from "still locked" in either direction. The load-based checks make
+this take a couple of minutes with ``--root``.
+
+Nothing here is skipped silently -- a check that cannot run says why. The kill
+tests also refuse to run at all if the card is already locked when they start,
+because every later measurement would be against a baseline that is not stock.
 """
 from __future__ import annotations
 
@@ -63,6 +73,51 @@ def skip(name, why):
 
 def read_record(state):
     return json.loads(Path(state).read_text())["record"]
+
+
+#: A card locked at 900 MHz cannot exceed it under load; an unlocked 3060 Ti
+#: reaches ~1900. Wide margins on both sides so thermal or power capping cannot
+#: turn an unlocked card into a false "locked".
+LOCKED_CEILING = 1000
+UNLOCKED_FLOOR = 1200
+
+
+def clock_under_load(seconds=5.0):
+    """Peak SM clock while the GPU is actually being driven.
+
+    **The idle clock is not a probe for a clock lock, and using it as one is a
+    claim without evidence.** An idle card sits at ~210 MHz whether or not a
+    lock is applied, and a card locked at [900, 900] sits at 900 when idle too
+    -- so a bare `nvmlDeviceGetClockInfo` read cannot distinguish "restored"
+    from "still locked" in either direction. The first version of this file did
+    exactly that and reported four false failures, including "GPU LEFT
+    MODIFIED" for a card reading 210 MHz, which is precisely the unlocked-idle
+    value.
+
+    This driver exposes no `nvmlDeviceGetGpuLockedClocks`. The only way to
+    observe a lock is to demand clocks and see whether they are capped, which
+    is what `tools/verify_clock_lock.py` does and what this now does too.
+    """
+    proc = subprocess.Popen(
+        [PY, str(REPO / "tools/synthetic_gpu_load.py"),
+         "--duration", str(seconds + 3), "--period", str(seconds + 3),
+         "--duty", "1.0"],
+        cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    peak = 0
+    try:
+        time.sleep(2.0)                       # let the clocks ramp
+        end = time.time() + seconds
+        while time.time() < end:
+            v = sm_clock()
+            if v:
+                peak = max(peak, v)
+            time.sleep(0.25)
+    finally:
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return peak
 
 
 def sm_clock():
@@ -168,32 +223,48 @@ def unprivileged(tmp):
 
 
 def kill_tests(tmp):
-    print("\n-- kill tests (real clock writes) --")
-    base = sm_clock()
-    if base is None:
+    print("\n-- kill tests (real clock writes, verified under load) --")
+    idle = sm_clock()
+    if idle is None:
         skip("all kill tests", "could not read the SM clock from NVML")
         return
-    print(f"          baseline SM clock: {base} MHz")
+    base = clock_under_load()
+    print(f"          idle {idle} MHz; peak under load {base} MHz")
+    if not check("the card is unlocked before we start", base >= UNLOCKED_FLOOR,
+                 f"peak {base} MHz -- something already holds a lock; run "
+                 f"`sudo python -m joule_agent.gpu_guard restore` first"):
+        skip("remaining kill tests", "cannot measure against a locked baseline")
+        return
+
+    def lock_proc(state, hold, extra=()):
+        return subprocess.Popen(
+            [PY, "-m", "joule_agent.gpu_guard", "--gpu", "0",
+             "--state-path", str(state), "lock", "--mhz", "900",
+             "--hold", str(hold), CONSENT, *extra],
+            cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
     # 1. clean exit
     s = tmp / "k1.json"
-    r = run(["lock", "--mhz", "900", "--hold", "3", CONSENT], s, timeout=120)
-    check("clean lock run exits 0", r.returncode == 0, f"{r.stdout!r} {r.stderr!r}")
-    check("...and the record ends settled",
+    p = lock_proc(s, 25)
+    held = clock_under_load()
+    rc = p.wait(timeout=120)
+    check("clean run: the lock really caps the clock", held <= LOCKED_CEILING,
+          f"peak {held} MHz under load with a 900 MHz lock applied")
+    check("clean run exits 0", rc == 0, f"rc={rc} {p.stderr.read()[-300:]!r}")
+    check("clean run: the record ends settled",
           s.exists() and read_record(s)["restored"] is True)
-    check("...and the clock came back", (sm_clock() or 0) > 900,
-          f"still at {sm_clock()} MHz")
+    after = clock_under_load()
+    check("clean run: the clock is released", after >= UNLOCKED_FLOOR,
+          f"peak {after} MHz -- GPU LEFT MODIFIED")
 
     # 2/3. SIGINT and SIGTERM mid-lock
     for signame, signum in (("SIGINT", signal.SIGINT), ("SIGTERM", signal.SIGTERM)):
         s = tmp / f"k-{signame}.json"
-        p = subprocess.Popen(
-            [PY, "-m", "joule_agent.gpu_guard", "--gpu", "0",
-             "--state-path", str(s), "lock", "--mhz", "900", "--hold", "30",
-             CONSENT],
-            cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        time.sleep(6)
-        locked = sm_clock()
+        p = lock_proc(s, 120)
+        held = clock_under_load()
+        check(f"{signame}: the lock was applied first", held <= LOCKED_CEILING,
+              f"peak {held} MHz -- the lock never took effect, so the rest "
+              f"proves nothing")
         p.send_signal(signum)
         try:
             p.wait(timeout=60)
@@ -201,24 +272,24 @@ def kill_tests(tmp):
             p.kill()
             check(f"{signame} terminates the run", False, "still running after 60s")
             continue
-        time.sleep(2)
-        check(f"{signame}: the lock was actually applied first",
-              locked is not None and locked <= 950, f"clock was {locked} MHz")
-        check(f"{signame}: the clock is restored", (sm_clock() or 0) > 950,
-              f"still at {sm_clock()} MHz -- GPU LEFT MODIFIED")
+        after = clock_under_load()
+        check(f"{signame}: the clock is restored", after >= UNLOCKED_FLOOR,
+              f"peak {after} MHz -- GPU LEFT MODIFIED")
         check(f"{signame}: the record ends settled",
               s.exists() and read_record(s)["restored"] is True,
               f"{read_record(s) if s.exists() else 'no file'}")
 
     # 4. SIGKILL, then recover
     s = tmp / "k4.json"
-    r = run(["lock", "--mhz", "900", "--hold", "30", "--crash-after", "5", CONSENT],
-            s, timeout=120)
+    r = run(["lock", "--mhz", "900", "--hold", "120", "--crash-after", "6", CONSENT],
+            s, timeout=180)
     check("SIGKILL: the process really died by signal", r.returncode == -signal.SIGKILL,
           f"rc={r.returncode}")
-    killed_at = sm_clock()
+    killed = clock_under_load()
     check("SIGKILL: the GPU is left modified, as expected",
-          killed_at is not None and killed_at <= 950, f"clock is {killed_at} MHz")
+          killed <= LOCKED_CEILING,
+          f"peak {killed} MHz -- nothing was left to recover, so the recovery "
+          f"checks below prove nothing")
     check("SIGKILL: the record survives saying so",
           s.exists() and read_record(s)["restored"] is False
           and read_record(s)["clocks_locked"] is True,
@@ -229,8 +300,9 @@ def kill_tests(tmp):
 
     r = run(["restore"], s, timeout=120)
     check("recovery exits 0", r.returncode == 0, f"{r.stdout!r} {r.stderr!r}")
-    check("recovery reset the clock", (sm_clock() or 0) > 950,
-          f"still at {sm_clock()} MHz -- RECOVERY FAILED")
+    recovered = clock_under_load()
+    check("recovery released the clock", recovered >= UNLOCKED_FLOOR,
+          f"peak {recovered} MHz -- RECOVERY FAILED, GPU STILL LOCKED")
     check("recovery cleared the record",
           read_record(s)["restored"] is True, f"{read_record(s)}")
 
