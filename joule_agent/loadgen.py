@@ -382,11 +382,26 @@ class RunReport:
     latency_p95_s: float | None = None
     latency_p99_s: float | None = None
 
+    #: Every completed request's latency, ascending. Percentiles alone cannot
+    #: answer "what fraction breached the SLO", which is the sweep's headline
+    #: latency metric, so the raw values are kept. Deliberately excluded from
+    #: :meth:`to_dict` -- see there.
+    latencies_s: list = field(default_factory=list)
+
     metrics_samples: int = 0
     warnings: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        """Summary only: ``latencies_s`` is dropped.
+
+        It is unbounded in the request count, and this dict is what the CLI's
+        ``--out`` writes. A closed verification gate should not start emitting a
+        different-shaped document because a later component needed a field.
+        Callers wanting the raw values read the attribute.
+        """
+        d = asdict(self)
+        d.pop("latencies_s", None)
+        return d
 
 
 class LoadGenerator:
@@ -548,6 +563,7 @@ class LoadGenerator:
                 )
 
         if lat:
+            rep.latencies_s = lat
             rep.latency_p50_s = round(_pct(lat, 50), 4)
             rep.latency_p95_s = round(_pct(lat, 95), 4)
             rep.latency_p99_s = round(_pct(lat, 99), 4)
