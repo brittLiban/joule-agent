@@ -769,6 +769,106 @@ def test_grid_leads_with_stock_so_an_early_death_still_has_a_baseline():
     assert [p.name for p in grid] == ["stock", "clk900", "clk1200"]
 
 
+def _energy_by_point(order, energies):
+    """A sampler that charges each point its own energy on the closing read."""
+    class S(FakeSampler):
+        def __init__(self):
+            super().__init__()
+            self.i = 0
+
+        def poll(self):
+            name = order[(self.i // 2) % len(order)]
+            if self.i % 2 == 1:
+                self.energy_mj += energies[name]
+            out = {"energy_mj": self.energy_mj, "temperature_c": 40.0,
+                   "sm_clock_mhz": 1000}
+            self.i += 1
+            return out
+    return S()
+
+
+def test_a_power_capping_point_is_measured_but_not_trusted():
+    """The power axis has no efficacy gate, so its rows are data, not answers.
+
+    Collecting them is deliberate: a null result there cheaply corroborates the
+    published "illusion of power capping" finding, and "nothing happened" is a
+    weak claim that weak evidence can carry.
+
+    Mutation: drop `axis_verified` from the eligibility filter and the power
+    point becomes best_point.
+    """
+    sched = build_schedule("poisson", seed=7, duration_s=5.0)
+    world = FakeWorld(sched.digest(), tokens_per_run=1000.0)
+    order = ["stock", "clk900", "pl150W"]
+    # the power point is the cheapest by a wide margin
+    energies = {"stock": 1000.0, "clk900": 900.0, "pl150W": 400.0}
+
+    result = SweepRunner(
+        endpoint="e", model="m", schedule=sched,
+        points=[SweepPoint(), SweepPoint(clock_mhz=900),
+                SweepPoint(power_limit_mw=150000)],
+        repeats=2, guard_factory=lambda: FakeGuard([]),
+        load_runner=world.load_runner,
+        gpu_sampler=_energy_by_point(order, energies),
+        metrics_reader=world.metrics, sleep=lambda s: None).run()
+
+    pl = next(s for s in result.summaries if s.name == "pl150W")
+    assert pl.axis_verified is False
+    assert pl.joules_per_token_mean is not None, "it must still be MEASURED"
+    # ...but it must not be the answer.
+    assert result.best_point == "clk900"
+    assert result.best_unverified_point == "pl150W"
+    assert any("no efficacy gate" in w for w in result.warnings)
+    assert any("SURPRISING result on an unverified axis" in w
+               for w in result.warnings)
+
+
+def test_clock_only_points_are_trusted():
+    """The complement: `axis_verified` must not be False for everything."""
+    sched = build_schedule("poisson", seed=7, duration_s=5.0)
+    world = FakeWorld(sched.digest())
+    result = SweepRunner(
+        endpoint="e", model="m", schedule=sched,
+        points=[SweepPoint(), SweepPoint(clock_mhz=900)], repeats=2,
+        guard_factory=lambda: FakeGuard([]), load_runner=world.load_runner,
+        gpu_sampler=FakeSampler(), metrics_reader=world.metrics,
+        sleep=lambda s: None).run()
+    assert all(s.axis_verified for s in result.summaries)
+    assert result.best_unverified_point is None
+    assert not any("no efficacy gate" in w for w in result.warnings)
+
+
+def test_a_snapped_clock_is_reported_because_the_point_name_is_the_request():
+    """This card snaps SM clocks to a 15 MHz grid: ask 1400, get 1410.
+
+    `SweepPoint.name` -- and so `best_point` -- is built from the REQUEST, so
+    "best = clk1400" would name a configuration the card never ran.
+    """
+    sched = build_schedule("poisson", seed=7, duration_s=5.0)
+    world = FakeWorld(sched.digest())
+    result = SweepRunner(
+        endpoint="e", model="m", schedule=sched,
+        points=[SweepPoint(clock_mhz=1400)], repeats=1,
+        guard_factory=lambda: FakeGuard([]), load_runner=world.load_runner,
+        gpu_sampler=FakeSampler(clock_by_call=[1410]),
+        metrics_reader=world.metrics, sleep=lambda s: None).run()
+    assert any("clk1400 ran at 1410 MHz" in w for w in result.warnings)
+    assert any("cite achieved_clock_median_mhz" in w for w in result.warnings)
+
+
+def test_an_exactly_honoured_clock_raises_no_mislabel_warning():
+    """The complement -- otherwise the warning fires on every sweep."""
+    sched = build_schedule("poisson", seed=7, duration_s=5.0)
+    world = FakeWorld(sched.digest())
+    result = SweepRunner(
+        endpoint="e", model="m", schedule=sched,
+        points=[SweepPoint(clock_mhz=1410)], repeats=1,
+        guard_factory=lambda: FakeGuard([]), load_runner=world.load_runner,
+        gpu_sampler=FakeSampler(clock_by_call=[1410]),
+        metrics_reader=world.metrics, sleep=lambda s: None).run()
+    assert not any("ran at" in w for w in result.warnings)
+
+
 def test_power_limits_without_clocks_still_produce_points():
     """Regression: crossing only inside `for clk in clocks` dropped them all.
 

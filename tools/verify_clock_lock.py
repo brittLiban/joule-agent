@@ -81,6 +81,15 @@ LOAD_SCRIPT = REPO / "tools" / "synthetic_gpu_load.py"
 #: clock reading describes an idle card rather than a configuration.
 MIN_LOADED_UTIL_PCT = 50.0
 
+#: Margin for every comparison made against the UNLOCKED baseline: did the
+#: clock return to it, and is a target far enough from it to be distinguished
+#: from no lock at all. Sized from the baseline's own within-run spread (~30
+#: MHz on the 3060 Ti), with headroom -- deliberately NOT the same number as
+#: ``--tolerance-mhz``, which sizes bin-snapping slack and must be larger.
+#: Sharing one constant let a card left pinned at 1800 MHz pass as restored
+#: against a 1920 MHz baseline.
+DEFAULT_BASELINE_MARGIN_MHZ = 45
+
 
 def load_argv(seconds: float, python: str) -> list:
     """The exact command each phase runs to drive the GPU.
@@ -213,7 +222,8 @@ def provenance(args, python: str) -> dict:
         "gpu_guard_sha256": _sha256(REPO / "joule_agent" / "gpu_guard.py"),
         "python": python,
         "args": {"targets_mhz": args.targets, "seconds": args.seconds,
-                 "tolerance_mhz": args.tolerance_mhz},
+                 "tolerance_mhz": args.tolerance_mhz,
+                 "baseline_margin_mhz": args.baseline_margin_mhz},
         "load_argv": load_argv(args.seconds, python),
         "driver_version": None,
         "nvml_version": None,
@@ -248,8 +258,25 @@ def provenance(args, python: str) -> dict:
 
 
 def judge(baseline: dict, locked: list, recovered: dict, targets: list,
-          tolerance: int) -> dict:
-    """Decide what the phases prove. Pure -- no hardware, so it is testable."""
+          tolerance: int, baseline_margin: int = DEFAULT_BASELINE_MARGIN_MHZ) -> dict:
+    """Decide what the phases prove. Pure -- no hardware, so it is testable.
+
+    **Two margins, not one.** A single ``tolerance`` was doing four jobs whose
+    directional requirements conflict: ``near_target`` wants it LARGE (a device
+    may snap to a bin), while ``discriminable``, ``changed_from_baseline`` and
+    ``restored_to_baseline`` all want it SMALL. At 120 MHz against a 1920 MHz
+    baseline that produced a hole big enough to drive the original defect back
+    through: a card left pinned at **1800** -- the last lock applied, so the
+    likeliest restore failure of that target set -- satisfied
+    ``abs(1800 - 1920) <= 120`` and the tool printed LOCK WORKS and exited 0.
+    The same coincidence simultaneously made a working 1800 MHz lock
+    untestable. One constant cannot be both.
+
+    ``tolerance`` now governs only achieved-vs-requested. ``baseline_margin``
+    governs everything measured against the baseline, and is sized from the
+    baseline's own observed spread (~30 MHz within a run on this card), not
+    from bin-snapping headroom.
+    """
     phases = [baseline, *locked, recovered]
     unloaded = [p["phase"] for p in phases if not p.get("loaded")]
     if unloaded:
@@ -260,21 +287,24 @@ def judge(baseline: dict, locked: list, recovered: dict, targets: list,
     base = baseline["median_mhz"]
     rec = recovered["median_mhz"]
 
-    # Restore is checked against BASELINE. Never against the locked value --
-    # that only asks whether the clock rose, which a partial restore satisfies.
-    restored_to_baseline = abs(rec - base) <= tolerance
+    # Restore is checked against BASELINE, with the tight margin. Never
+    # against the locked value -- that only asks whether the clock rose, which
+    # a partial restore satisfies -- and never with the bin-snapping tolerance,
+    # which is wide enough to swallow the top target of a normal sweep.
+    restored_to_baseline = abs(rec - base) <= baseline_margin
 
     per_target, effective, inconclusive = [], [], []
     for tgt, ph in zip(targets, locked):
         achieved = ph["median_mhz"]
         near = abs(achieved - tgt) <= tolerance
-        # A target within tolerance of the unlocked boost clock cannot be
+        # A target within the baseline margin of the unlocked boost clock
+        # cannot be
         # distinguished from "no lock at all" by this method. That is a limit
         # of the probe, not a failure of the device.
-        discriminable = abs(tgt - base) > tolerance
+        discriminable = abs(tgt - base) > baseline_margin
         row = {"target_mhz": tgt, "achieved_median_mhz": achieved,
                "near_target": near, "discriminable": discriminable,
-               "changed_from_baseline": abs(achieved - base) > tolerance}
+               "changed_from_baseline": abs(achieved - base) > baseline_margin}
         per_target.append(row)
         if not discriminable:
             inconclusive.append(tgt)
@@ -301,7 +331,7 @@ def judge(baseline: dict, locked: list, recovered: dict, targets: list,
     if not testable:
         verdict["result"] = "INCONCLUSIVE"
         verdict["reason"] = (
-            f"every target was within {tolerance} MHz of the {base:.0f} MHz "
+            f"every target was within {baseline_margin} MHz of the {base:.0f} MHz "
             "unlocked clock, so none could be distinguished from no lock. "
             "Choose targets well below the boost clock."
         )
@@ -320,6 +350,11 @@ def judge(baseline: dict, locked: list, recovered: dict, targets: list,
     achieved = [r["achieved_median_mhz"] for r in testable]
     # Distinct requests must produce distinct clocks, or sweep rows labelled by
     # requested clock are not distinct configurations.
+    # Separation deliberately keeps the WIDE constant: demanding a large gap
+    # between achieved clocks is the conservative direction, and two clocks
+    # closer than this are not configurations a sweep can hope to tell apart in
+    # energy. This is the one baseline-independent comparison, so it does not
+    # belong to `baseline_margin`.
     separated = all(abs(a - b) > tolerance
                     for i, a in enumerate(achieved) for b in achieved[i + 1:])
     monotonic = all(a <= b for a, b in zip(achieved, achieved[1:]))
@@ -351,7 +386,7 @@ def judge(baseline: dict, locked: list, recovered: dict, targets: list,
         )
     if inconclusive:
         verdict["reason"] += (
-            f". Targets {inconclusive} were within {tolerance} MHz of the "
+            f". Targets {inconclusive} were within {baseline_margin} MHz of the "
             "unlocked clock and could not be tested."
         )
     return verdict
@@ -397,6 +432,40 @@ def locked_phases_for(targets, run_phase, controller_factory=None,
         yield ph
 
 
+def rejudge(artifact: Path, tolerance: int, baseline_margin: int) -> dict:
+    """Re-analyse a recorded run's raw phases under the current predicates.
+
+    Legitimate because the phases are *measurements* and :func:`judge` is a
+    pure function of them -- changing a threshold is re-analysis, not
+    re-measurement. It exists so that re-analysis is a recorded operation
+    producing its own stamped artifact, rather than something done in a shell
+    and quoted from memory. The output carries ``rejudged_from`` so a verdict
+    can always be traced to the run whose clocks it describes.
+
+    It does NOT substitute for a re-run: it cannot tell you whether the
+    achieved-clock map reproduces, which is a separate question.
+    """
+    doc = json.loads(artifact.read_text())
+    phases = doc.get("phases", [])
+    baseline = next((p for p in phases if p["phase"] == "baseline"), None)
+    recovered = next((p for p in phases if p["phase"] == "recovered"), None)
+    locked = [p for p in phases if p["phase"].startswith("locked@")]
+    if not (baseline and recovered and locked):
+        raise SystemExit(f"{artifact}: not a complete run (missing phases)")
+    targets = [int(p["phase"].split("@")[1]) for p in locked]
+    out = dict(doc)
+    out["verdict"] = judge(baseline, locked, recovered, targets, tolerance,
+                           baseline_margin)
+    out["rejudged_from"] = {
+        "artifact": str(artifact),
+        "original_verdict": doc.get("verdict", {}).get("result"),
+        "utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "tolerance_mhz": tolerance,
+        "baseline_margin_mhz": baseline_margin,
+    }
+    return out
+
+
 def _write(results: dict, out: Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(results, indent=2))
@@ -411,12 +480,38 @@ def main(argv=None) -> int:
                    help="single target (compatibility alias for --targets)")
     p.add_argument("--seconds", type=float, default=8.0)
     p.add_argument("--tolerance-mhz", type=int, default=120,
-                   help="how close an achieved clock must be to its target, "
-                        "and how close recovered must be to baseline")
+                   help="how close an achieved clock must be to its REQUEST "
+                        "(sizes bin-snapping slack)")
+    p.add_argument("--baseline-margin-mhz", type=int,
+                   default=DEFAULT_BASELINE_MARGIN_MHZ,
+                   help="margin for every comparison against the unlocked "
+                        "baseline: whether the clock came back, and whether a "
+                        "target is far enough from stock to be tested. Must "
+                        f"stay well below --tolerance-mhz (default "
+                        f"{DEFAULT_BASELINE_MARGIN_MHZ}).")
+    p.add_argument("--rejudge", default=None, metavar="ARTIFACT",
+                   help="re-analyse a recorded run's raw phases under the "
+                        "current predicates and write a new stamped artifact. "
+                        "Re-analysis, not re-measurement -- it cannot tell you "
+                        "whether the achieved-clock map reproduces.")
     p.add_argument("--out", default=None,
                    help="output path; default is a per-run timestamped file so "
                         "a re-run cannot erase the evidence from the last one")
     args = p.parse_args(argv)
+
+    if args.rejudge:
+        src = Path(args.rejudge)
+        doc = rejudge(src, args.tolerance_mhz, args.baseline_margin_mhz)
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        out = Path(args.out) if args.out else Path(
+            f"results/clock_lock_rejudged-{stamp}.json")
+        v = doc["verdict"]
+        print(f"re-judged {src}")
+        print(f"  was: {doc['rejudged_from']['original_verdict']}")
+        print(f"  now: {v['result']}")
+        print(f"  {v.get('reason', '')}")
+        _write(doc, out)
+        return 0 if v.get("result") == "LOCK WORKS" else 1
 
     if args.target_mhz is not None:
         args.targets = str(args.target_mhz)
@@ -465,7 +560,7 @@ def main(argv=None) -> int:
     print(f"  {recovered}", flush=True)
 
     results["verdict"] = judge(baseline, locked_phases, recovered, targets,
-                               args.tolerance_mhz)
+                               args.tolerance_mhz, args.baseline_margin_mhz)
     verdict = results["verdict"]
 
     prov = results["provenance"]

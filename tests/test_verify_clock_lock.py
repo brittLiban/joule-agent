@@ -78,6 +78,71 @@ def test_an_unloaded_phase_is_inconclusive_not_a_lock():
     assert "not under load" in v["reason"]
 
 
+def test_a_card_stuck_at_the_top_target_is_not_reported_restored():
+    """The restore hole the FIX opened, found by measurement-skeptic.
+
+    One `tolerance` served four predicates with opposing requirements.
+    `near_target` needs it LARGE (bin snapping); `restored_to_baseline` needs
+    it SMALL. At 120 MHz against a 1920 MHz baseline, a card left pinned at
+    **1800** -- the last lock applied, so the likeliest restore failure of this
+    target set -- satisfied `abs(1800 - 1920) <= 120`, and the tool printed
+    LOCK WORKS and exited 0. Exactly the class the previous fix closed,
+    relocated one predicate over.
+
+    Mutation: pass `baseline_margin=TOL` and this reports LOCK WORKS.
+    """
+    v = vcl.judge(
+        baseline=ph("baseline", 1920),
+        locked=[ph("locked@600", 600), ph("locked@1000", 1005),
+                ph("locked@1400", 1410), ph("locked@1800", 1800)],
+        recovered=ph("recovered", 1800),
+        targets=[600, 1000, 1400, 1800], tolerance=TOL,
+    )
+    assert v["result"] == "RESTORE FAILED"
+    assert v["recovered_to_baseline"] is False
+
+
+def test_the_two_margins_are_separate_constants():
+    """The wide one must not silently become the baseline margin again."""
+    assert vcl.DEFAULT_BASELINE_MARGIN_MHZ == 45
+    assert vcl.DEFAULT_BASELINE_MARGIN_MHZ < TOL, (
+        "the baseline margin must stay well below the bin-snapping tolerance; "
+        "collapsing them is what let a pinned card pass as restored")
+
+
+def test_bin_snapping_slack_is_still_wide_after_the_split():
+    """The complement: tightening the baseline margin must NOT make a
+    legitimately snapped clock (1400 -> 1410) fail its target."""
+    v = vcl.judge(
+        baseline=ph("baseline", 1920),
+        locked=[ph("locked@1400", 1410)],
+        recovered=ph("recovered", 1920),
+        targets=[1400], tolerance=TOL,
+    )
+    assert v["per_target"][0]["near_target"] is True
+    assert v["result"] == "LOCK WORKS"
+
+
+def test_rejudge_reanalyses_raw_phases_and_records_where_they_came_from(tmp_path):
+    """Re-analysis is legitimate -- `judge` is a pure function of measured
+    phases -- but it must be traceable to the run whose clocks it describes,
+    and it must not be mistaken for a re-run."""
+    import json
+
+    art = tmp_path / "run.json"
+    art.write_text(json.dumps({
+        "phases": [ph("baseline", 1920), ph("locked@1800", 1800),
+                   ph("recovered", 1800)],
+        "verdict": {"result": "LOCK WORKS"},
+    }))
+    out = vcl.rejudge(art, TOL, vcl.DEFAULT_BASELINE_MARGIN_MHZ)
+    assert out["verdict"]["result"] == "RESTORE FAILED"
+    assert out["rejudged_from"]["original_verdict"] == "LOCK WORKS"
+    assert out["rejudged_from"]["baseline_margin_mhz"] == 45
+    assert out["phases"] == json.loads(art.read_text())["phases"], (
+        "re-analysis must not alter the measurements")
+
+
 def test_a_target_within_tolerance_of_the_boost_clock_cannot_be_tested():
     """The old rule called a working high lock a NO-OP.
 
@@ -85,16 +150,34 @@ def test_a_target_within_tolerance_of_the_boost_clock_cannot_be_tested():
     functioning 1850 MHz lock on a 1920 MHz card was reported as the device
     ignoring the write -- failing in exactly the upper half of the range the
     sweep wants to use. The honest answer is that the probe cannot discriminate.
+
+    The threshold is now `baseline_margin` (45), not `tolerance` (120), so this
+    uses 1890 -- 30 MHz below baseline, inside the baseline's own within-run
+    spread. 1850 is now legitimately testable, which is the point of the split:
+    the old version of this test pinned the very threshold choice that let a
+    card stuck at 1800 pass as restored.
     """
+    v = vcl.judge(
+        baseline=ph("baseline", 1920),
+        locked=[ph("locked@1890", 1890)],
+        recovered=ph("recovered", 1920),
+        targets=[1890], tolerance=TOL,
+    )
+    assert v["result"] == "INCONCLUSIVE"
+    assert "none could be distinguished from no lock" in v["reason"]
+    assert v["per_target"][0]["discriminable"] is False
+
+
+def test_the_split_widened_the_testable_range():
+    """1850 was untestable under the shared constant and is testable now."""
     v = vcl.judge(
         baseline=ph("baseline", 1920),
         locked=[ph("locked@1850", 1850)],
         recovered=ph("recovered", 1920),
         targets=[1850], tolerance=TOL,
     )
-    assert v["result"] == "INCONCLUSIVE"
-    assert "none could be distinguished from no lock" in v["reason"]
-    assert v["per_target"][0]["discriminable"] is False
+    assert v["per_target"][0]["discriminable"] is True
+    assert v["result"] == "LOCK WORKS"
 
 
 def test_a_high_but_discriminable_target_is_still_judged():

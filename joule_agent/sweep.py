@@ -640,6 +640,10 @@ class PointSummary:
     slo_violation_rate_mean: float | None = None
     achieved_clock_median_mhz: float | None = None
     meets_slo: bool = False
+    #: False for any point that caps power. The clock axis has a behavioural
+    #: efficacy gate (`tools/verify_clock_lock.py`); the power axis has none,
+    #: so a power row's numbers are collected but not trusted.
+    axis_verified: bool = True
     #: True when this point's mean is within one standard deviation of the
     #: best point's mean -- i.e. the sweep cannot tell them apart.
     tied_with_best: bool = False
@@ -666,6 +670,10 @@ class SweepResult:
     slo_threshold_source: str = ""
     best_point: str | None = None
     tied_points: list = field(default_factory=list)
+    #: Set only when an UNVERIFIED (power-capping) point beat every verified
+    #: one. Kept separate from `best_point` so the headline answer never rests
+    #: on an axis with no efficacy gate.
+    best_unverified_point: str | None = None
     stock_drift_pct: float | None = None
     warnings: list = field(default_factory=list)
 
@@ -753,7 +761,8 @@ class SweepResult:
         for spec in self.points:
             name = spec["name"]
             group = by_point.get(name, [])
-            s = PointSummary(name=name, runs=len(group))
+            s = PointSummary(name=name, runs=len(group),
+                             axis_verified=spec.get("power_limit_mw") is None)
             jpt = [m.run.joules_per_generated_token for m in group
                    if m.run.joules_per_generated_token is not None]
             tps = [m.run.generated_tokens_per_s for m in group
@@ -788,6 +797,34 @@ class SweepResult:
             self.summaries.append(s)
 
         self._flag_indistinguishable_clocks()
+        self._flag_requested_vs_achieved()
+
+    def _flag_requested_vs_achieved(self) -> None:
+        """A row named for its request is mislabelled if the device snapped.
+
+        The 3060 Ti snaps SM clocks to a 15 MHz grid: ask 1400, get 1410; ask
+        1000, get 1005. `SweepPoint.name` and therefore `best_point` are built
+        from the REQUEST, so "best = clk1400" would name a configuration the
+        card never ran. The achieved value is the real setting and is what any
+        downstream citation must use.
+        """
+        by_name = {s["name"]: s for s in self.points}
+        drifted = []
+        for s in self.summaries:
+            spec = by_name.get(s.name, {})
+            req = spec.get("clock_mhz")
+            got = s.achieved_clock_median_mhz
+            if req is None or got is None:
+                continue
+            if abs(got - req) >= 1:
+                drifted.append(f"{s.name} ran at {got:.0f} MHz")
+        if drifted:
+            self.warnings.append(
+                "requested clocks are not the achieved clocks -- "
+                + "; ".join(drifted)
+                + ". Point names are built from the REQUEST, so cite "
+                  "achieved_clock_median_mhz, not the label."
+            )
 
     def _flag_indistinguishable_clocks(self) -> None:
         """Two requests that achieved the same clock are not two data points."""
@@ -812,9 +849,25 @@ class SweepResult:
         one of them "best" asserts a distinction the measurement does not
         support.
         """
-        eligible = [s for s in self.summaries
-                    if s.joules_per_token_mean is not None
-                    and (self.slo_threshold_s is None or s.meets_slo)]
+        scored = [s for s in self.summaries
+                  if s.joules_per_token_mean is not None
+                  and (self.slo_threshold_s is None or s.meets_slo)]
+        # The headline best point is chosen among VERIFIED rows only. Power
+        # rows are collected -- a null result there cheaply corroborates the
+        # published "illusion of power capping" finding, and "nothing happened"
+        # is a weak claim that weak evidence can carry -- but a power row
+        # WINNING is a surprising result, and that needs the efficacy gate this
+        # axis does not have before it becomes the answer.
+        eligible = [s for s in scored if s.axis_verified]
+        unverified = [s for s in scored if not s.axis_verified]
+        if unverified:
+            self.warnings.append(
+                f"{len(unverified)} power-capping point(s) were measured on an "
+                "axis with NO efficacy gate: nothing has confirmed on this "
+                "hardware that a power cap changes behaviour rather than being "
+                "silently ignored. Their numbers are recorded, not trusted, and "
+                "they are excluded from the best-point choice."
+            )
         if not eligible:
             self.warnings.append(
                 "no configuration both produced a joules/token figure and met "
@@ -836,6 +889,21 @@ class SweepResult:
                 "are within the resolution of this sweep. Treat them as tied "
                 "rather than ranked."
             )
+        beat_it = [s for s in unverified
+                   if s.joules_per_token_mean < best.joules_per_token_mean - band]
+        if beat_it:
+            winner = min(beat_it, key=lambda s: s.joules_per_token_mean)
+            self.best_unverified_point = winner.name
+            self.warnings.append(
+                f"{winner.name} beat the best verified point "
+                f"({winner.joules_per_token_mean:.6f} vs "
+                f"{best.joules_per_token_mean:.6f} J/token) -- but it caps "
+                "power, an axis with no efficacy gate on this hardware. That is "
+                "a SURPRISING result on an unverified axis, which is exactly "
+                "the case that needs the gate built before it is believed. "
+                "Build the power-limit equivalent of tools/verify_clock_lock.py "
+                "before citing this."
+            )
 
     def to_dict(self) -> dict:
         return {
@@ -852,6 +920,7 @@ class SweepResult:
             "slo_threshold_source": self.slo_threshold_source,
             "best_point": self.best_point,
             "tied_points": self.tied_points,
+            "best_unverified_point": self.best_unverified_point,
             "stock_drift_pct": self.stock_drift_pct,
             "summaries": [s.to_dict() for s in self.summaries],
             "runs": [r.to_dict() for r in self.runs],
@@ -1133,6 +1202,8 @@ def format_report(result: SweepResult) -> str:
             flag = "  <- best"
         elif s.tied_with_best:
             flag = "  (tied)"
+        if not s.axis_verified:
+            flag += "  *UNVERIFIED AXIS"
         lines.append(
             f"{s.name:<14}{s.runs:>4}{f(s.joules_per_token_mean, '.6f'):>12}"
             f"{f(s.joules_per_token_stdev, '.6f'):>10}"
@@ -1142,6 +1213,9 @@ def format_report(result: SweepResult) -> str:
             f"{f(s.achieved_clock_median_mhz, '.0f'):>9}{flag}"
         )
     lines.append("-" * 78)
+    if any(not s.axis_verified for s in result.summaries):
+        lines.append("* power-capping rows: measured, NOT trusted -- the power "
+                     "axis has no efficacy gate on this hardware.")
     if result.stock_drift_pct is not None:
         lines.append(f"stock drift across rounds: {result.stock_drift_pct:+.2f}%")
     if result.aborted:
