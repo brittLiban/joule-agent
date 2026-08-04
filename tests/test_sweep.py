@@ -869,6 +869,25 @@ def test_an_exactly_honoured_clock_raises_no_mislabel_warning():
     assert not any("ran at" in w for w in result.warnings)
 
 
+def test_requesting_power_limits_still_leaves_an_uncapped_row_per_clock():
+    """Otherwise the trusted clock curve does not exist.
+
+    Crossing clocks only against the requested caps gave every non-stock point
+    a power limit, so every one was `axis_verified: false` and `best_point`
+    could only ever be "stock" -- the sole verified row. A 28-point, 3-repeat,
+    60s-per-run grid would have burned ~2 hours to answer nothing.
+
+    Mutation: `powers = list(power_limits_mw)` and the uncapped rows vanish.
+    """
+    grid = build_grid([900, 1200], [150000])
+    names = [p.name for p in grid]
+    assert names == ["stock", "clk900", "clk900-pl150W",
+                     "clk1200", "clk1200-pl150W"]
+    verified = [p for p in grid if p.power_limit_mw is None]
+    assert [p.name for p in verified] == ["stock", "clk900", "clk1200"], (
+        "every clock needs an uncapped row on the gated axis")
+
+
 def test_power_limits_without_clocks_still_produce_points():
     """Regression: crossing only inside `for clk in clocks` dropped them all.
 

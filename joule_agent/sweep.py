@@ -152,7 +152,14 @@ def build_grid(clocks, power_limits_mw=None, *, include_stock: bool = True) -> l
     baseline every other number is relative to.
     """
     points = [SweepPoint()] if include_stock else []
-    powers = list(power_limits_mw) if power_limits_mw else [None]
+    # `None` first, ALWAYS -- so every clock is also measured with no power cap.
+    # Crossing clocks only against the requested caps meant that asking for any
+    # power limit left the clock axis with no uncapped row at all: every
+    # non-stock point carried a cap, every one was `axis_verified: false`, and
+    # `best_point` could only ever come back "stock" because stock was the sole
+    # verified row. Hours of GPU time for a vacuous answer. The trusted clock
+    # curve has to exist independently of the axis that has no gate.
+    powers = [None, *power_limits_mw] if power_limits_mw else [None]
     # `clocks or [None]`, not `clocks`: crossing only inside `for clk in
     # clocks` meant that requesting power limits with NO clocks produced a
     # stock-only grid -- so the operator was pushed through consent, root and
