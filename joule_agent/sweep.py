@@ -281,6 +281,7 @@ class SweepRunner:
         slo_slack: float = DEFAULT_SLO_SLACK,
         slo_ms: float | None = None,
         settle_s: float = 5.0,
+        warmup_runs: int = 1,
         guard_factory=None,
         load_runner=None,
         gpu_sampler=None,
@@ -312,6 +313,7 @@ class SweepRunner:
         self.slo_slack = slo_slack
         self.slo_ms = slo_ms
         self.settle_s = settle_s
+        self.warmup_runs = warmup_runs
 
         self._guard_factory = guard_factory
         self._load_runner = load_runner or self._default_load_runner
@@ -546,6 +548,23 @@ class SweepRunner:
     def run(self) -> "SweepResult":
         execution_index = 0
         try:
+            # Warm the card to thermal steady state BEFORE the first measured
+            # point, and discard what the warm-up produces.
+            #
+            # Measured on real traffic: across three identical stock rounds,
+            # generated tokens and tokens/sec were flat (18683/18603/18609 and
+            # 686/683/683) while mean power rose 123.9 -> 128.3 -> 129.5 W as
+            # the die went 40 -> 70 C. Same work, more joules: leakage current
+            # rising with temperature. That is +4.95% joules/token of pure
+            # thermal ramp, larger than the effect a sweep is trying to resolve.
+            #
+            # It is not merely noise, it is BIASED noise: stock leads the grid
+            # and leads every round, so stock's first run is the coldest
+            # measurement in the sweep -- and stock is the reference every other
+            # point is compared against. Uncorrected, a cold stock flatters
+            # itself and understates every clock lock.
+            for _ in range(self.warmup_runs):
+                self._load_runner(self.schedule)
             for round_index in range(self.repeats):
                 for point in self.points:
                     measured = self._run_point(point, round_index, execution_index)
@@ -1262,6 +1281,13 @@ def main(argv=None) -> int:
     p.add_argument("--slo-slack", type=float, default=DEFAULT_SLO_SLACK,
                    help=f"multiplier on stock p99 defining the SLO "
                         f"(default {DEFAULT_SLO_SLACK}).")
+    p.add_argument("--warmup-runs", type=int, default=1,
+                   help="discarded full-load passes before the first measured "
+                        "point, to reach thermal steady state (default 1). "
+                        "Measured on this card: joules/token rose ~5%% across "
+                        "three identical stock rounds purely from the die "
+                        "warming 40->70 C, and stock runs first, so an "
+                        "uncorrected sweep flatters its own reference.")
     p.add_argument("--settle-s", type=float, default=5.0,
                    help="pause after applying a config before measuring")
     p.add_argument("--gpu", type=int, default=0)
@@ -1416,6 +1442,7 @@ def main(argv=None) -> int:
         endpoint=args.endpoint, model=args.model, schedule=schedule,
         points=points, repeats=args.repeats, slo_ms=args.slo_ms,
         slo_slack=args.slo_slack, settle_s=args.settle_s,
+        warmup_runs=args.warmup_runs,
         guard_factory=guard_factory, gpu_sampler=sampler,
     )
     prov = provenance(args)

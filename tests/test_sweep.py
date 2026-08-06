@@ -165,7 +165,7 @@ def test_every_point_replays_the_same_schedule_object():
     SweepRunner(endpoint="e", model="m", schedule=sched,
                 points=[SweepPoint(), SweepPoint(clock_mhz=900)], repeats=2,
                 guard_factory=lambda: FakeGuard([]), load_runner=runner,
-                sleep=lambda s: None).run()
+                warmup_runs=0, sleep=lambda s: None).run()
     assert len(seen) == 4
     assert all(m is sched._replay_marker for m in seen)
 
@@ -211,7 +211,8 @@ def test_the_stock_point_never_constructs_a_guard():
     runner = SweepRunner(endpoint="e", model="m", schedule=sched,
                          points=[SweepPoint()], repeats=2,
                          guard_factory=factory, load_runner=world.load_runner,
-                         metrics_reader=world.metrics, sleep=lambda s: None)
+                         metrics_reader=world.metrics, warmup_runs=0,
+                         sleep=lambda s: None)
     result = runner.run()
     assert calls == []
     # `calls == []` alone is satisfied by the point never running at all, so
@@ -257,7 +258,7 @@ def test_a_below_floor_clock_is_refused_before_the_guard_is_ever_constructed():
         endpoint="e", model="m", schedule=sched,
         points=[SweepPoint(clock_mhz=10)], guard_factory=factory,
         load_runner=world.load_runner, metrics_reader=world.metrics,
-        sleep=lambda s: None).run()
+        warmup_runs=0, sleep=lambda s: None).run()
     assert result.aborted
     assert "below the" in result.abort_reason
     assert "nothing was armed or written" in result.abort_reason
@@ -281,7 +282,7 @@ def test_a_failed_restore_aborts_the_whole_sweep():
         endpoint="e", model="m", schedule=sched, points=points,
         guard_factory=lambda: FakeGuard([], fail_on_exit=boom),
         load_runner=world.load_runner, metrics_reader=world.metrics,
-        sleep=lambda s: None)
+        warmup_runs=0, sleep=lambda s: None)
     result = runner.run()
     assert result.aborted
     assert result.hardware_may_be_modified
@@ -347,7 +348,8 @@ def test_a_point_needing_hardware_without_a_guard_is_a_refusal_not_a_silent_stoc
     result = SweepRunner(endpoint="e", model="m", schedule=sched,
                          points=[SweepPoint(clock_mhz=900)],
                          guard_factory=None, load_runner=world.load_runner,
-                         metrics_reader=world.metrics, sleep=lambda s: None).run()
+                         metrics_reader=world.metrics, warmup_runs=0,
+                         sleep=lambda s: None).run()
     assert result.aborted
     assert "no guard was supplied" in result.abort_reason
     assert world.runs == 0
@@ -373,6 +375,31 @@ def test_repeats_are_round_robin_not_grouped_by_point():
     runner.run()
     assert [m.run.point for m in runner.runs] == [
         "stock", "clk900", "stock", "clk900"]
+
+
+def test_the_warmup_run_happens_and_is_discarded():
+    """Measured on real traffic: three identical stock rounds held tokens and
+    tokens/sec flat while mean power rose 123.9 -> 129.5 W as the die went
+    40 -> 70 C. Same work, more joules -- leakage rising with temperature,
+    +4.95% joules/token of pure thermal ramp.
+
+    It is BIASED, not merely noisy: stock leads the grid and leads every round,
+    so stock's first run is the coldest measurement in the sweep, and stock is
+    what every other point is normalised against.
+
+    Mutation: drop the warm-up loop and `world.runs` falls to 1.
+    """
+    sched = build_schedule("poisson", seed=7, duration_s=5.0)
+    world = FakeWorld(sched.digest())
+    runner = SweepRunner(
+        endpoint="e", model="m", schedule=sched, points=[SweepPoint()],
+        repeats=1, warmup_runs=1, load_runner=world.load_runner,
+        gpu_sampler=FakeSampler(), metrics_reader=world.metrics,
+        sleep=lambda s: None)
+    result = runner.run()
+    assert world.runs == 2, "one warm-up plus one measured run"
+    assert len(runner.runs) == 1, "the warm-up must not be recorded"
+    assert result.summaries[0].runs == 1
 
 
 def test_stock_drifting_between_rounds_is_reported_and_warned():
@@ -986,7 +1013,7 @@ def test_the_sampler_is_stopped_even_when_the_load_generator_raises():
     result = SweepRunner(
         endpoint="e", model="m", schedule=sched, points=[SweepPoint()],
         load_runner=exploding_load, gpu_sampler=sampler,
-        sleep=lambda s: None).run()
+        warmup_runs=0, sleep=lambda s: None).run()
     assert sampler.stopped, "the polling thread outlived the measurement"
     assert result.aborted
     assert "OSError" in result.abort_reason
