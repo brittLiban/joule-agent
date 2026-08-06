@@ -809,11 +809,19 @@ class SweepResult:
                 s.achieved_clock_median_mhz = round(statistics.mean(clk), 1)
 
             if self.slo_threshold_s is not None:
-                rates = [
-                    r for r in (slo_violation_rate(m.latencies_s, self.slo_threshold_s)
-                                for m in group)
-                    if r is not None
-                ]
+                # Assign back onto each PointRun too. The threshold is not
+                # known until every run is in (it is derived from stock's
+                # median p99), so `_measure` cannot fill this -- which left
+                # `slo_violation_rate` empty in all 84 rows of runs.csv while
+                # `slo_violation_rate_mean` carried the real value under a
+                # near-identical name. A column that looks like data and is
+                # always blank is worse than no column.
+                rates = []
+                for m in group:
+                    r = slo_violation_rate(m.latencies_s, self.slo_threshold_s)
+                    m.run.slo_violation_rate = r
+                    if r is not None:
+                        rates.append(r)
                 if rates:
                     s.slo_violation_rate_mean = round(statistics.mean(rates), 4)
                 s.meets_slo = (

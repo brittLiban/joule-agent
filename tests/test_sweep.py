@@ -550,6 +550,30 @@ def test_an_explicit_slo_overrides_the_derived_one():
     assert "explicit" in result.slo_threshold_source
 
 
+def test_the_per_run_slo_violation_rate_is_actually_filled_in():
+    """It was declared on PointRun and never assigned, so runs.csv carried an
+    always-empty column beside a summary field with a near-identical name.
+
+    It cannot be filled at measure time -- the threshold is derived from
+    stock's median p99 once every run is in -- so it is assigned during
+    finalise. Mutation: drop the assignment and this reads None.
+    """
+    # Explicit --slo-ms, because a derived SLO is stock p99 x 1.1 and a lone
+    # stock point therefore cannot violate its own threshold by construction.
+    sched = build_schedule("poisson", seed=7, duration_s=5.0)
+    world = FakeWorld(sched.digest(), latencies=[0.1] * 8 + [2.0, 3.0])
+    runner = SweepRunner(
+        endpoint="e", model="m", schedule=sched, points=[SweepPoint()],
+        repeats=1, warmup_runs=0, slo_ms=150.0, load_runner=world.load_runner,
+        gpu_sampler=FakeSampler(), metrics_reader=world.metrics,
+        sleep=lambda s: None)
+    result = runner.run()
+    rate = runner.runs[0].run.slo_violation_rate
+    assert rate is not None, "the per-run column must not be empty"
+    assert rate == pytest.approx(result.summaries[0].slo_violation_rate_mean)
+    assert 0.0 < rate < 1.0, "this fixture has both passing and failing requests"
+
+
 def test_no_completed_requests_is_not_a_zero_violation_rate():
     """0.0 would read as 'met the SLO perfectly'. It is no measurement."""
     assert slo_violation_rate([], 1.0) is None
