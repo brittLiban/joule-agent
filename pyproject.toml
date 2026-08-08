@@ -18,8 +18,10 @@ dev = [
     "pytest>=8",
 ]
 
-# No [project.scripts] yet -- the `joule` entry point lands with the benchmark
-# CLI (component 6). Until then: python -m joule_agent.telemetry
+[project.scripts]
+# `joule benchmark ...` -- the subcommand word is accepted and ignored, so the
+# documented form and a bare `joule --model ...` both work.
+joule = "joule_agent.cli:main"
 
 [tool.setuptools]
 packages = ["joule_agent"]
