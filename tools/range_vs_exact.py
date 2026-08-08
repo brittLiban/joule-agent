@@ -116,6 +116,10 @@ def main(argv=None):
                    help="the tuned-static clock, e.g. 1560")
     p.add_argument("--range-min", type=int, default=None,
                    help="range lower bound; default = device minimum")
+    p.add_argument("--warmup", type=float, default=60.0,
+                   help="seconds of discarded traffic before the first measured "
+                        "leg. A cold first leg biases its pair; see the comment "
+                        "in main(). 0 disables.")
     p.add_argument("--out", default=None)
     args = p.parse_args(argv)
 
@@ -129,6 +133,21 @@ def main(argv=None):
 
     print(f"exact [{args.exact},{args.exact}]  vs  range [{lo},{args.exact}]")
     print(f"interleaved x2 so session drift cancels in the paired difference\n")
+
+    # Warm the card BEFORE the first measured leg, and discard the result.
+    # Omitting this produced a monotone -1.76% decline across four legs on the
+    # reference card, large enough that the cold first leg made its pair read
+    # -1.34% while the warm pair read -0.07%. Interleaving cancels LINEAR drift;
+    # a cold-start transient concentrated in leg 1 is not linear, so the design
+    # does not save you. sweep.py learned this in 9a63b14; this instrument was
+    # rebuilt without it.
+    if args.warmup > 0:
+        print(f"  warming ({args.warmup:.0f}s, discarded) ...", flush=True)
+        subprocess.run(
+            [PY, "-m", "joule_agent.loadgen", "--preset", args.preset,
+             "--seed", str(args.seed), "--duration", str(args.warmup)],
+            capture_output=True, text=True, timeout=1800)
+        time.sleep(10)
 
     rows = []
     for i, (a, b) in enumerate([(args.exact, None), (lo, args.exact)] * 2, 1):
@@ -149,6 +168,10 @@ def main(argv=None):
 
     print(f"\n{'=' * 66}")
     print(f"paired energy delta: {d1:+.2f}%  and  {d2:+.2f}%  ->  {dj:+.2f}%")
+    if abs(d1 - d2) > abs(dj):
+        print("  *** THE PAIRS DISAGREE BY MORE THAN THE EFFECT. Something is")
+        print("  *** drifting faster than the interleaving cancels -- check the")
+        print("  *** per-leg J/tok for a monotone trend before believing this.")
     print(f"p99 delta:           {dp * 1000:+.0f} ms "
           f"({st.mean(r['p99_s'] for r in ex) * 1000:.0f} -> "
           f"{st.mean(r['p99_s'] for r in rg) * 1000:.0f})")

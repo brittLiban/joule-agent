@@ -99,7 +99,41 @@ The project's original question was whether phase-aware clock control beats a
 well-tuned static lock by more than ~10% at equal p99. Two independent methods
 put the available margin at roughly half that.
 
-### Idle-gap ceiling: 5.5%
+### Idle-gap ceiling: 4.7% with perfect foresight, 2.8% realistic
+
+`f_idle` was measured, not assumed. Under `bursty` at the tuned-static clock the
+engine is empty **42.1%** of wall time, in 12 contiguous gaps with a 2.53 s
+median (stock: 43.4% / 43.0% across two runs, agreeing to 0.30%). The nominal
+duty cycle of 0.5 was optimistic by ~13%.
+
+Contiguous duration is what a controller can use, so the exploitable fraction is
+`Σ max(0, gᵢ − τ) / T` for a detection-plus-actuation reserve τ:
+
+| | f | ceiling |
+|---|---|---|
+| perfect foresight (τ = 0) | 0.421 | **4.7%** |
+| τ = 0.5 s (sensor cadence) | 0.332 | **3.7%** |
+| τ = 1.0 s (realistic causal) | 0.254 | **2.8%** |
+
+A controller needing one second to detect and act loses 39% of the opportunity
+before it writes a clock. Reproduce with `tools/idle_fraction.py`.
+
+**And a static clock range does not take it.** Every "tuned static" number here
+used an exact `[f, f]` lock, which holds the clock up through gaps; NVML has
+always accepted `[min, max]`, but the CLI could not express it. The mechanism
+works — `[405, 1560]` with no traffic descends to 405 MHz and 13.5 W. Under
+`bursty` it does not: paired against an exact lock on identical traffic, the
+warm pair measured **−0.07%** energy at identical p99 (mean power 85.7 vs
+85.6 W). If the range were descending across 42% of wall time it would show
+3–4 W lower mean power; it shows 0.1 W. **The governor descends at sustained
+idle but not within 2.5 s gaps**, so the idle opportunity stays out of static's
+reach — and the tuned-static champion remains the exact lock.
+`tools/range_vs_exact.py`.
+
+### The superseded figure: 5.5%
+
+The originally published 5.5% assumed `f_idle = 0.5` from the preset's duty
+cycle. The ΔP measurement below stands; only the assumed fraction was wrong.
 
 `ceiling = f_idle × ΔP / P_loaded`. Four 60 s legs with **no traffic**,
 interleaved 1590/405/1590/405:
