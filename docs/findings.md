@@ -118,6 +118,29 @@ Contiguous duration is what a controller can use, so the exploitable fraction is
 A controller needing one second to detect and act loses 39% of the opportunity
 before it writes a clock. Reproduce with `tools/idle_fraction.py`.
 
+**τ, measured rather than guessed.** A guarded clock write returns in **~23 ms**
+(including the state-file fsync). First *observation* of the new clock is
+**~200 ms** — but 29 of 30 transitions landed within 3 ms of that figure in both
+directions, and a physical settling process has variance. That constancy is the
+reporting path: `nvmlDeviceGetClockInfo` refreshes with ~200 ms latency, the same
+class of limit component 1 found in the power sensor. **True actuation lies
+somewhere in [23, 200] ms and this instrument cannot separate them** — so 200 ms
+is an upper bound, not a measurement. It also fills a hole in the sensor profile,
+which previously recorded `sm_clock_mhz: observed_changes 0`.
+
+Folding that in, with an up+down pair costing at most 400 ms of a 2.53 s gap:
+
+| | f | ceiling |
+|---|---|---|
+| oracle, optimistic actuation (2×25 ms) | 0.410 | 4.5% |
+| oracle, pessimistic actuation (2×200 ms) | 0.348 | **3.9%** |
+| causal, 500 ms signal age + actuation | 0.269 | **3.0%** |
+| causal, 1 s signal age + actuation | 0.191 | 2.1% |
+
+**Per-epoch control is physically viable on this device** — actuation costs at
+most 16% of a median gap. What it cannot do is reach 10% from idle gaps alone.
+Reproduce with `tools/verify_clock_transition.py`.
+
 **And a static clock range does not take it.** Every "tuned static" number here
 used an exact `[f, f]` lock, which holds the clock up through gaps; NVML has
 always accepted `[min, max]`, but the CLI could not express it. The mechanism
