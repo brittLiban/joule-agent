@@ -170,17 +170,32 @@ the oracle-to-causal penalty is **0.3–1.0 percentage points** — there is alm
 no gap for better engineering to close. The ceiling itself is the problem.
 `tools/verify_signal_freshness.py`.
 
-**And a static clock range does not take it.** Every "tuned static" number here
-used an exact `[f, f]` lock, which holds the clock up through gaps; NVML has
-always accepted `[min, max]`, but the CLI could not express it. The mechanism
-works — `[405, 1560]` with no traffic descends to 405 MHz and 13.5 W. Under
-`bursty` it does not: paired against an exact lock on identical traffic, the
-warm pair measured **−0.07%** energy at identical p99 (mean power 85.7 vs
-85.6 W). If the range were descending across 42% of wall time it would show
-3–4 W lower mean power; it shows 0.1 W. **The governor descends at sustained
-idle but not within 2.5 s gaps**, so the idle opportunity stays out of static's
-reach — and the tuned-static champion remains the exact lock.
-`tools/range_vs_exact.py`.
+**And a static clock range takes almost none of it.** Every "tuned static"
+number here used an exact `[f, f]` lock, which holds the clock up through gaps;
+NVML has always accepted `[min, max]`, but the CLI could not express it. The
+mechanism works — `[405, 1560]` with no traffic descends to 405 MHz and 13.5 W.
+
+Under `bursty` it barely helps. Across two runs, three settled exact/range pairs
+on identical traffic measured **−0.07%, −0.14%, −0.57%** (mean −0.26%, stdev
+0.27) at p99 within 1 ms. Mean power differs by **0.2 W**. Full idle capture
+would show 3–4 W, so the range reaches roughly **5% of the theoretical idle
+saving**. The direction is consistent across all three pairs, so a small real
+effect is plausible; the magnitude does not move any downstream number.
+
+**The governor descends at sustained idle but not within 2.5 s gaps**, so the
+idle opportunity stays out of static's reach. Under the preregistered
+tie-handling rule — unresolved uncertainty favours the stronger comparator — the
+range's (marginally lower) energy is the demanding denominator for any dynamic
+claim, and the difference is small enough that it does not change the Gate 2
+target. `tools/range_vs_exact.py`.
+
+**Method note, because the first two attempts both got this wrong.** A 60 s
+warm-up was *not* enough: the first exact leg still read 3.1% above the two
+later exact legs, which agreed with each other to 0.02%. Averaging that cold
+pair in produced a −1.08% "range wins" from a run whose settled pairs read
+−0.14% and −0.57%. The tool now uses its own repeated exact legs as a control,
+excludes a first pair that deviates by more than 1%, and refuses to render any
+verdict when the surviving pairs disagree by more than the effect.
 
 ### The superseded figure: 5.5%
 

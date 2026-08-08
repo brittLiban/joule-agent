@@ -116,6 +116,10 @@ def main(argv=None):
                    help="the tuned-static clock, e.g. 1560")
     p.add_argument("--range-min", type=int, default=None,
                    help="range lower bound; default = device minimum")
+    p.add_argument("--pairs", type=int, default=3,
+                   help="interleaved exact/range PAIRS. Two is the minimum that "
+                        "can show the pairs disagreeing; three is the minimum "
+                        "that can show which one is the outlier.")
     p.add_argument("--warmup", type=float, default=60.0,
                    help="seconds of discarded traffic before the first measured "
                         "leg. A cold first leg biases its pair; see the comment "
@@ -150,7 +154,8 @@ def main(argv=None):
         time.sleep(10)
 
     rows = []
-    for i, (a, b) in enumerate([(args.exact, None), (lo, args.exact)] * 2, 1):
+    plan = [(args.exact, None), (lo, args.exact)] * args.pairs
+    for i, (a, b) in enumerate(plan, 1):
         r = leg(args.endpoint, args.preset, args.seed, args.duration,
                 a, b, hold)
         rows.append(r)
@@ -161,22 +166,52 @@ def main(argv=None):
 
     ex = [r for r in rows if r["config"] == f"[{args.exact},{args.exact}]"]
     rg = [r for r in rows if r["config"] == f"[{lo},{args.exact}]"]
-    d1 = 100 * (rg[0]["j_per_gen_token"] - ex[0]["j_per_gen_token"]) / ex[0]["j_per_gen_token"]
-    d2 = 100 * (rg[1]["j_per_gen_token"] - ex[1]["j_per_gen_token"]) / ex[1]["j_per_gen_token"]
-    dj = (d1 + d2) / 2
+    # Pair each range leg with the exact leg it immediately followed, so a
+    # monotone session trend cancels within the pair instead of across the run.
+    deltas = [100 * (rg[i]["j_per_gen_token"] - ex[i]["j_per_gen_token"])
+              / ex[i]["j_per_gen_token"] for i in range(min(len(ex), len(rg)))]
+
+    # Detect a still-cold first pair and exclude it, rather than averaging it in.
+    # Measured: with a 60 s warm-up the first exact leg still read 3.1% above the
+    # two later exact legs, which agreed with each other to 0.02%. Averaging that
+    # pair in produced a -1.08% "range wins" from three pairs whose settled
+    # members read -0.14% and -0.57%. A warm-up is a fix for a transient, not a
+    # guarantee it has ended -- so check, using the repeated EXACT legs as their
+    # own control.
+    excluded = None
+    if len(ex) >= 3:
+        later = st.median([r["j_per_gen_token"] for r in ex[1:]])
+        drift = 100 * (ex[0]["j_per_gen_token"] - later) / later
+        if abs(drift) > 1.0:
+            excluded = drift
+            deltas = deltas[1:]
+    dj = st.mean(deltas)
     dp = st.mean(r["p99_s"] for r in rg) - st.mean(r["p99_s"] for r in ex)
 
     print(f"\n{'=' * 66}")
-    print(f"paired energy delta: {d1:+.2f}%  and  {d2:+.2f}%  ->  {dj:+.2f}%")
-    if abs(d1 - d2) > abs(dj):
+    print("paired energy delta: "
+          + "  ".join(f"{d:+.2f}%" for d in deltas)
+          + f"  ->  mean {dj:+.2f}%"
+          + (f", stdev {st.stdev(deltas):.2f}" if len(deltas) > 2 else ""))
+    if max(deltas) - min(deltas) > abs(dj):
         print("  *** THE PAIRS DISAGREE BY MORE THAN THE EFFECT. Something is")
         print("  *** drifting faster than the interleaving cancels -- check the")
         print("  *** per-leg J/tok for a monotone trend before believing this.")
+    if excluded is not None:
+        print(f"  pair 1 EXCLUDED: its exact leg ran {excluded:+.1f}% against the "
+              f"later exact legs,")
+        print(f"  so the card was still settling. The warm-up was too short, not "
+              f"absent.")
     print(f"p99 delta:           {dp * 1000:+.0f} ms "
           f"({st.mean(r['p99_s'] for r in ex) * 1000:.0f} -> "
           f"{st.mean(r['p99_s'] for r in rg) * 1000:.0f})")
     print("=" * 66)
-    if dj < -1.0 and dp <= 0.002:
+    if len(deltas) > 1 and max(deltas) - min(deltas) > abs(dj):
+        print("NO VERDICT. The surviving pairs disagree by more than the effect,")
+        print("so this run cannot separate a real difference from drift. Report")
+        print("the per-pair numbers, not the mean. More pairs, or a longer")
+        print("warm-up -- not a conclusion.")
+    elif dj < -1.0 and dp <= 0.002:
         print("RANGE WINS, and not by spending latency. The tuned-static")
         print("baseline should become the range, which MOVES THE DENOMINATOR")
         print("for any dynamic claim. Re-derive the champion before Gate 2.")
