@@ -146,6 +146,9 @@ is true on yours.
 The specific percentages above were measured on driver 595.71.05 and are pending
 re-verification on 595.84. Run the tool rather than citing them.
 
+Full detail, with the caveats attached and the reproduction commands, is in
+[docs/findings.md](docs/findings.md).
+
 ---
 
 ## What this does not do
