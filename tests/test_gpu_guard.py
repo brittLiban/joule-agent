@@ -2720,3 +2720,64 @@ def test_a_surrendered_guard_cannot_republish_over_a_new_claim(tmp_path,
         b.restore()
     finally:
         signal.signal(signal.SIGTERM, prev)
+
+
+# ---------------------------------------------------------------------------
+# Clock ranges: [min, max] was always supported by lock_clocks and by NVML;
+# only the CLI could not express it, so every measurement in this repo used an
+# exact lock. Exposing it must not weaken any refusal.
+# ---------------------------------------------------------------------------
+
+
+def test_a_range_lock_reaches_nvml_as_min_and_max(tmp_path):
+    """Mutation: drop max_mhz on the CLI path and the write collapses to an
+    exact lock while still reporting success -- the silent failure that would
+    make a range experiment measure nothing."""
+    c = FakeGpuController()
+    with guard(tmp_path, controller=c) as g:
+        g.lock_clocks(405, 1560)
+        assert c.locked == (405, 1560), c.locked   # inside: exit restores
+    assert c.locked is None, "the range was not restored on exit"
+
+
+def test_an_exact_lock_is_still_min_equals_max(tmp_path):
+    c = FakeGpuController()
+    with guard(tmp_path, controller=c) as g:
+        g.lock_clocks(1560)
+        assert c.locked == (1560, 1560), c.locked
+
+
+def test_the_floor_applies_to_both_ends_of_a_range(tmp_path):
+    """A range must not smuggle a sub-floor bound past the check.
+
+    Mutation: check only min_mhz and a [1560, 100] request reaches the device.
+    """
+    c = FakeGpuController()
+    g = guard(tmp_path, controller=c)
+    with pytest.raises(ClockFloorError):
+        g.lock_clocks(MIN_SM_CLOCK_MHZ - 1, 1560)
+    with pytest.raises(ClockFloorError):
+        g.lock_clocks(1560, MIN_SM_CLOCK_MHZ - 1)
+    assert c.locked is None, "a refused range still reached the device"
+
+
+def test_an_inverted_range_is_refused(tmp_path):
+    c = FakeGpuController()
+    g = guard(tmp_path, controller=c)
+    with pytest.raises(ClockFloorError) as exc:
+        g.lock_clocks(1560, 405)
+    assert "min 1560 > max 405" in str(exc.value)
+    assert c.locked is None
+
+
+def test_the_cli_exposes_max_mhz():
+    """The capability existed for the whole project and was unreachable.
+
+    Mutation: remove --max-mhz and every range experiment silently becomes an
+    exact-lock experiment, which is how the tuned-static baseline went untested
+    against a range for this long.
+    """
+    a = build_parser().parse_args(["lock", "--mhz", "405", "--max-mhz", "1560"])
+    assert (a.mhz, a.max_mhz) == (405, 1560)
+    b = build_parser().parse_args(["lock", "--mhz", "1560"])
+    assert b.max_mhz is None

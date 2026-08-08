@@ -1805,7 +1805,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     lk = sub.add_parser("lock", help="lock the SM clock, hold, then restore")
-    lk.add_argument("--mhz", type=int, required=True)
+    lk.add_argument("--mhz", type=int, required=True,
+                    help="SM clock in MHz. With --max-mhz this is the RANGE "
+                         "MINIMUM; alone it is an exact lock (min == max).")
+    lk.add_argument("--max-mhz", type=int, default=None,
+                    help="upper bound of a clock RANGE. `lock_clocks` and "
+                         "`nvmlDeviceSetGpuLockedClocks` have always taken "
+                         "[min, max]; only this CLI could not express it, so "
+                         "every measurement in this repo used an exact lock. "
+                         "A range lets the device's own governor float between "
+                         "the bounds -- whether it actually descends during "
+                         "idle is per-device and must be measured, not assumed.")
     lk.add_argument("--hold", type=float, default=5.0, help="seconds")
     lk.add_argument(CONSENT_FLAG, dest="consent", action="store_true")
     lk.add_argument(
@@ -1852,10 +1862,16 @@ def main(argv=None) -> int:
             # does not check consent: snapshotting is a read, and reads never
             # require it.
             guard._check_consent()
-            guard._check_clock_floor(args.mhz, args.mhz)
+            top = args.mhz if args.max_mhz is None else args.max_mhz
+            guard._check_clock_floor(args.mhz, top)
             with guard:
-                guard.lock_clocks(args.mhz)
-                print(f"locked SM clock at {args.mhz} MHz; holding {args.hold}s")
+                guard.lock_clocks(args.mhz, args.max_mhz)
+                if args.max_mhz is None:
+                    print(f"locked SM clock at {args.mhz} MHz; "
+                          f"holding {args.hold}s")
+                else:
+                    print(f"locked SM clock to range [{args.mhz}, {top}] MHz; "
+                          f"holding {args.hold}s")
                 if args.crash_after is not None:
                     time.sleep(args.crash_after)
                     print("simulating hard kill (SIGKILL to self)", flush=True)
