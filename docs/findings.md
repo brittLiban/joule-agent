@@ -200,7 +200,18 @@ inherited.
 | energy counter cadence | — | 99.94 ms | recorded |
 | energy agreement, oscillating load | 0.18% @ 110 W | 0.43% @ 113.8 W | passes (<2%) |
 | clock bin width | 15 MHz, rounds up | pending | open |
-| SLO thresholds | 658.6 / 1355.1 ms | pending | open |
+| stock p99 median (`bursty`) | 598.7 ms | 604.3 ms | inside prior range |
+| derived budget (`bursty`) | 658.6 ms | 664.7 ms | +0.93% |
+
+**Stock p99 did not move outside the band session drift already explains.** Three
+pre-upgrade sessions measured 598.9 / 604.0 / 598.7 ms — a 0.89% spread. The
+595.84 session measured **604.3 ms**, which is +0.05% from the closest prior
+session and inside that range. At n=1 on the new driver this cannot separate a
+small driver effect from ordinary between-session drift, and it does not need to:
+either way the derivation is per-session and re-derived, which is why the protocol
+freezes a fresh threshold rather than importing a literal.
+
+This says nothing about the clock-energy curve or bin width, which remain open.
 
 The sensor cadence carrying over unchanged is the load-bearing one: it bounds any
 control loop, and the ~500 ms figure that makes a 20 ms loop unevaluable still
