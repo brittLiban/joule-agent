@@ -12,6 +12,7 @@ from joule_agent.loadgen import RunReport, build_schedule
 from joule_agent.gpu_guard import GpuGuardError
 from joule_agent.sweep import (
     DEFAULT_SLO_SLACK,
+    MIN_STOCK_RUNS_FOR_SLO,
     NOISE_FLOOR_FRACTION,
     SweepError,
     SweepPoint,
@@ -536,6 +537,66 @@ def test_slo_threshold_is_derived_from_stock_p99_and_says_so():
     assert result.slo_threshold_s == pytest.approx(1.0 * DEFAULT_SLO_SLACK)
     assert "derived" in result.slo_threshold_source
     assert "stock median p99" in result.slo_threshold_source
+
+
+def test_an_undersampled_derived_slo_warns_and_records_its_own_error():
+    """The threshold decides every verdict, so its sampling error is recorded.
+
+    Measured 2026-08-07: stock p99 has ~0.37% within-session stdev, and near the
+    knee p99 moves ~1.09% per 15 MHz step -- so a 3-sample median leaves enough
+    error to flip a point by most of a grid step between sessions. Mutation:
+    drop the warning and a 3-repeat sweep silently reports a threshold it cannot
+    support.
+    """
+    sched = build_schedule("poisson", seed=7, duration_s=5.0)
+    world = FakeWorld(sched.digest(), latencies=[0.1] * 9 + [1.0])
+    runner = SweepRunner(
+        endpoint="e", model="m", schedule=sched, points=[SweepPoint()],
+        repeats=3, warmup_runs=0, load_runner=world.load_runner,
+        gpu_sampler=FakeSampler(), metrics_reader=world.metrics,
+        sleep=lambda s: None)
+    result = runner.run()
+
+    assert result.slo_stock_samples == 3
+    assert result.slo_stock_p99_median_s is not None
+    assert result.slo_stock_p99_stdev_s is not None
+    assert any("derived from 3 stock run" in w for w in result.warnings), \
+        result.warnings
+    # the artifact must carry it, not just the in-memory object
+    assert result.to_dict()["slo_stock_samples"] == 3
+
+
+def test_a_well_sampled_derived_slo_does_not_warn():
+    sched = build_schedule("poisson", seed=7, duration_s=5.0)
+    world = FakeWorld(sched.digest(), latencies=[0.1] * 9 + [1.0])
+    runner = SweepRunner(
+        endpoint="e", model="m", schedule=sched, points=[SweepPoint()],
+        repeats=MIN_STOCK_RUNS_FOR_SLO, warmup_runs=0,
+        load_runner=world.load_runner, gpu_sampler=FakeSampler(),
+        metrics_reader=world.metrics, sleep=lambda s: None)
+    result = runner.run()
+    assert result.slo_stock_samples == MIN_STOCK_RUNS_FOR_SLO
+    assert not any("stock run" in w for w in result.warnings), result.warnings
+
+
+def test_an_explicit_slo_records_no_derivation_provenance_and_never_warns():
+    """An operator-supplied SLO is a requirement, not an estimate.
+
+    It must not inherit the sampling-error warning, and must not claim
+    provenance it does not have. Mutation: let the warning fire regardless of
+    mode and a customer passing --slo-ms is told their own SLO is undersampled.
+    """
+    sched = build_schedule("poisson", seed=7, duration_s=5.0)
+    world = FakeWorld(sched.digest(), latencies=[0.1] * 9 + [1.0])
+    runner = SweepRunner(
+        endpoint="e", model="m", schedule=sched, points=[SweepPoint()],
+        repeats=1, warmup_runs=0, slo_ms=500.0,
+        load_runner=world.load_runner, gpu_sampler=FakeSampler(),
+        metrics_reader=world.metrics, sleep=lambda s: None)
+    result = runner.run()
+    assert result.slo_stock_samples is None
+    assert result.slo_stock_p99_median_s is None
+    assert not any("stock run" in w for w in result.warnings), result.warnings
 
 
 def test_an_explicit_slo_overrides_the_derived_one():

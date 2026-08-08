@@ -96,6 +96,14 @@ NOISE_FLOOR_FRACTION = 0.02
 #: reading of "equal" given a 2% measurement noise floor.
 DEFAULT_SLO_SLACK = 1.10
 
+#: Stock runs needed before a *derived* SLO threshold is trustworthy. Measured
+#: 2026-08-07 on the RTX 3060 Ti: stock p99 has a within-session stdev of 0.37%,
+#: so a 10-sample median gives ~0.12% SEM while a 3-sample median leaves enough
+#: error to flip points that sit within one grid step of the threshold. An
+#: explicit --slo-ms bypasses this entirely: an operator-supplied SLO is an
+#: absolute requirement, not an estimate, and is used unchanged.
+MIN_STOCK_RUNS_FOR_SLO = 10
+
 
 class SweepError(RuntimeError):
     """The sweep cannot produce a comparable result."""
@@ -694,6 +702,11 @@ class SweepResult:
     summaries: list = field(default_factory=list)
     slo_threshold_s: float | None = None
     slo_threshold_source: str = ""
+    #: Provenance of a *derived* threshold, so its own sampling error is
+    #: auditable rather than assumed. None when --slo-ms was supplied.
+    slo_stock_samples: int | None = None
+    slo_stock_p99_median_s: float | None = None
+    slo_stock_p99_stdev_s: float | None = None
     best_point: str | None = None
     tied_points: list = field(default_factory=list)
     #: Set only when an UNVERIFIED (power-capping) point beat every verified
@@ -753,6 +766,26 @@ class SweepResult:
         self.slo_threshold_source = (
             f"derived: stock median p99 {base:.4f}s x {slo_slack}"
         )
+        # The threshold decides every verdict in the sweep, so its own sampling
+        # error is recorded rather than assumed. Measured 2026-08-07 on this
+        # card: within a session stock p99 has stdev ~0.37%, so a 10-sample
+        # median pins the threshold to ~0.12%; a 3-sample median does not, and
+        # near the knee p99 moves only ~1.09% per 15 MHz step -- an
+        # under-sampled threshold moves the answer by most of a grid step.
+        self.slo_stock_samples = len(stock)
+        self.slo_stock_p99_median_s = round(base, 5)
+        self.slo_stock_p99_stdev_s = (
+            round(statistics.stdev(stock), 5) if len(stock) > 1 else None
+        )
+        if len(stock) < MIN_STOCK_RUNS_FOR_SLO:
+            self.warnings.append(
+                f"the SLO threshold was derived from {len(stock)} stock run(s); "
+                f"at least {MIN_STOCK_RUNS_FOR_SLO} is the calibrated minimum. "
+                "Points near the threshold may flip between sessions. Either "
+                "raise --repeats, or calibrate once with a stock-only run and "
+                "pass the result as --slo-ms (which is then frozen for every "
+                "point in the comparison)."
+            )
 
     def _detect_drift(self, by_point) -> None:
         """Compare stock against itself across rounds.
@@ -952,6 +985,9 @@ class SweepResult:
             "hardware_may_be_modified": self.hardware_may_be_modified,
             "slo_threshold_s": self.slo_threshold_s,
             "slo_threshold_source": self.slo_threshold_source,
+            "slo_stock_samples": self.slo_stock_samples,
+            "slo_stock_p99_median_s": self.slo_stock_p99_median_s,
+            "slo_stock_p99_stdev_s": self.slo_stock_p99_stdev_s,
             "best_point": self.best_point,
             "tied_points": self.tied_points,
             "best_unverified_point": self.best_unverified_point,
