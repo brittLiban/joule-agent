@@ -141,6 +141,35 @@ Folding that in, with an up+down pair costing at most 400 ms of a 2.53 s gap:
 most 16% of a median gap. What it cannot do is reach 10% from idle gaps alone.
 Reproduce with `tools/verify_clock_transition.py`.
 
+**CORRECTION: the controller's signal is ~37 ms, not 500 ms.** Earlier versions
+of this page discounted a causal controller by the power sensor's ~500 ms
+refresh. That was the wrong term — a queue-driven policy never reads power;
+power is how the *experiment* measures energy, not how the *policy* sees the
+world. Measured by scraping `/metrics` 17,099 times in 45 s under load:
+
+| field | changes | median gap |
+|---|---|---|
+| `num_requests_running` | 557 | **34.9 ms** |
+| `generation_tokens_total` | 7070 | **2.9 ms** |
+| `num_requests_waiting` | 0 | never moved |
+| `GET /metrics` latency | — | 2.5 ms median |
+
+So the controller's budget is **~37 ms of signal age + ~23 ms to issue the write
++ ≤200 ms for it to take effect** — not the ~900 ms previously assumed.
+
+| | f | ceiling |
+|---|---|---|
+| oracle, zero switching cost | 0.421 | 4.7% |
+| causal, optimistic (2×60 ms) | 0.396 | **4.4%** |
+| causal, pessimistic (2×260 ms) | 0.329 | **3.6%** |
+| *causal, old 500 ms assumption* | *0.269* | *3.0%* |
+
+**This makes the negative result stronger, not weaker.** The usual defence of
+dynamic control is that the oracle is high and only prediction is missing. Here
+the oracle-to-causal penalty is **0.3–1.0 percentage points** — there is almost
+no gap for better engineering to close. The ceiling itself is the problem.
+`tools/verify_signal_freshness.py`.
+
 **And a static clock range does not take it.** Every "tuned static" number here
 used an exact `[f, f]` lock, which holds the clock up through gaps; NVML has
 always accepted `[min, max]`, but the CLI could not express it. The mechanism
@@ -181,8 +210,8 @@ Reproduce with `tools/idle_gap_ceiling.sh`.
 405 → 810, so ΔP is SM and memory P-state *jointly*; if the memory half is not
 recoverable the ceiling is *lower*. And 5.5% is a bound nothing approaches — a
 controller gives back power only during a gap it has *detected*, and detection is
-bounded by the ~500 ms power-sensor refresh plus the metrics scrape cadence. On a
-3 s gap that is most of the gap at the wrong clock.
+bounded by how fast it can see the engine's state -- **measured at ~37 ms**, not
+the ~500 ms an earlier version of this file claimed. See the correction below.
 
 ### Per-request oracle: 5.79%
 
@@ -285,8 +314,9 @@ freezes a fresh threshold rather than importing a literal.
 This says nothing about the clock-energy curve or bin width, which remain open.
 
 The sensor cadence carrying over unchanged is the load-bearing one: it bounds any
-control loop, and the ~500 ms figure that makes a 20 ms loop unevaluable still
-holds.
+control loop for ENERGY ATTRIBUTION, and the ~500 ms figure still bounds how
+finely energy can be attributed to a decision. It does NOT bound the decision
+itself -- see the signal-freshness correction in section 3.
 
 The agreement figure moved 0.18% → 0.43%. Both are far inside the 2% gate, so the
 gate closes either way. It is n=1 on each side under unmatched conditions (the
