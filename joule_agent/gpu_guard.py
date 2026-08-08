@@ -885,7 +885,7 @@ class GpuGuard:
                     f"Refusing to arm: an earlier guard in this process (pid "
                     f"{pid}) FAILED its restore ({prior.get('restore_errors')}) "
                     "and the device may still be modified. Run `sudo python -m "
-                    f"joule_agent.gpu_guard restore --gpu {prior.get('device_index', 0)}` "
+                    f"joule_agent.gpu_guard --gpu {prior.get('device_index', 0)} restore` "
                     "before arming again."
                 )
             raise GuardBusyError(
@@ -933,7 +933,7 @@ class GpuGuard:
                 "the record is the only evidence there is, and clearing it is "
                 "an operator's decision, not this module's."
             )
-            + f" Run `sudo python -m joule_agent.gpu_guard restore{gpu_flag}` "
+            + f" Run `sudo python -m joule_agent.gpu_guard{gpu_flag} restore` "
             "first. Arming would overwrite the only evidence that exists."
         )
 
@@ -1488,7 +1488,7 @@ def check_stale_state(
             report["recommendation"] = (
                 "Restore the UUID read first -- a driver reload usually does it "
                 "-- then re-run this check. To lift a cap meanwhile, `sudo "
-                f"python -m joule_agent.gpu_guard restore --gpu {dev} "
+                f"python -m joule_agent.gpu_guard --gpu {dev} restore "
                 "--force-power-default` resets THIS card to its own default "
                 "without applying anyone's snapshot, and leaves the record "
                 "intact. The record itself stays until identity can be "
@@ -1503,9 +1503,9 @@ def check_stale_state(
             f"{prior.get('device_index')}."
         )
         report["recommendation"] = (
-            "Run `sudo python -m joule_agent.gpu_guard restore --gpu "
-            f"{prior.get('device_index')}` -- recovery must target the device "
-            "the record names."
+            "Run `sudo python -m joule_agent.gpu_guard --gpu "
+            f"{prior.get('device_index')} restore` -- recovery must target "
+            "the device the record names."
         )
         return report
     if prior and not prior.get("restored", True):
@@ -1549,11 +1549,12 @@ def check_stale_state(
             if target is None:
                 target = dev if dev is not None else 0
             report["recommendation"] = (
-                f"Run `sudo python -m joule_agent.gpu_guard restore --gpu "
-                f"{target}` to return the device to stock. The --gpu flag "
-                "matters: recovery applies the record's snapshot to whatever "
-                "device it is pointed at. Safe even if nothing is actually "
-                "locked -- the clock reset is a no-op on an unlocked GPU."
+                f"Run `sudo python -m joule_agent.gpu_guard --gpu "
+                f"{target} restore` to return the device to stock. The --gpu "
+                "flag matters: recovery applies the record's snapshot to "
+                "whatever device it is pointed at. Safe even if nothing is "
+                "actually locked -- the clock reset is a no-op on an unlocked "
+                "GPU."
             )
     return report
 
@@ -1769,7 +1770,15 @@ def _controller(args) -> GpuController:
         ) from exc
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the CLI parser.
+
+    Split out of :func:`main` so a test can assert that the recovery command
+    this module *recommends* actually parses. ``--gpu`` is a parent-level option
+    and must precede the subcommand; every recommendation string in this file
+    had that order backwards, and the test meant to catch it asserted that a
+    substring appeared rather than running the parser over it.
+    """
     p = argparse.ArgumentParser(
         prog="joule_agent.gpu_guard",
         description="Guarded GPU clock/power writes with guaranteed restore.",
@@ -1806,7 +1815,11 @@ def main(argv=None) -> int:
         help="TEST ONLY: hard-kill this process mid-lock to exercise recovery",
     )
 
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
     guard = None
     c = None
     try:

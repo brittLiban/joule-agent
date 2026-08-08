@@ -37,9 +37,37 @@ from joule_agent.gpu_guard import (
     GuardBusyError,
     PrivilegeError,
     ThreadAffinityError,
+    build_parser,
     check_stale_state,
     restore_from_state_file,
 )
+
+
+def assert_recommends_runnable_command(msg):
+    """Every `joule_agent.gpu_guard ...` command in `msg` must actually parse.
+
+    The check this replaces asserted the substring "restore --gpu 0" appeared.
+    That passed against a command which exits with `unrecognized arguments:
+    --gpu 0` -- `--gpu` is a parent-level option and must precede the
+    subcommand. Asserting that a recovery command is *named* is not asserting
+    that it *runs*, and this is the message an operator reads when the GPU may
+    still be modified, so it is the one that has to work.
+    """
+    import re
+    import shlex
+
+    cmds = re.findall(r"`([^`]*joule_agent\.gpu_guard[^`]*)`", msg)
+    assert cmds, f"no gpu_guard command recommended in: {msg!r}"
+    for cmd in cmds:
+        toks = shlex.split(cmd)
+        rest = toks[toks.index("joule_agent.gpu_guard") + 1:]
+        try:
+            build_parser().parse_args(rest)
+        except SystemExit as exc:
+            raise AssertionError(
+                f"recommended command does not parse: {cmd!r}"
+            ) from exc
+    return cmds
 
 
 @pytest.fixture(autouse=True)
@@ -1708,7 +1736,8 @@ def test_the_busy_message_does_not_overstate_an_arm_only_record(tmp_path):
     msg = str(exc.value)
     assert "may still be modified" not in msg, msg
     assert "no clock lock and no power write" in msg
-    assert "restore --gpu 0" in msg, "the resolving command is not named"
+    assert "--gpu 0 restore" in msg, "the resolving command is not named"
+    assert_recommends_runnable_command(msg)
 
     # A record that DOES name a write must still say so.
     doc["record"]["clocks_locked"] = True
