@@ -27,7 +27,8 @@ benchmark` command.
 evidence so far does not support it on the hardware tested (see
 [What we found](#what-we-found)).
 
-**Tested on:** NVIDIA RTX 3060 Ti, driver 595.71.05, vLLM 0.26.0, Qwen2.5-0.5B-Instruct.
+**Tested on:** NVIDIA RTX 3060 Ti, drivers 595.71.05 and 595.84, vLLM 0.26.0,
+Qwen2.5-0.5B-Instruct.
 Datacenter GPU validation is pending. Treat everything here as verified on one
 consumer card until that changes.
 
@@ -79,9 +80,9 @@ calibrates and freezes its own, in one pass.
 ### 3. Read the report
 
 ```
-THIS RUN MEASURED     29.6% lower energy per token
-  p99 latency         +9.1%  (604 -> 659 ms)
-  throughput          -0.4%  (595 -> 593 tok/s)
+THIS RUN MEASURED     33.2% lower energy per token
+  p99 latency         +10.7%  (599 -> 664 ms)
+  throughput          -0.3%  (596 -> 594 tok/s)
 ```
 
 Then set the clock yourself — `joule-agent` recommends, it does not install anything
@@ -142,9 +143,15 @@ is true on yours.
   Two unrelated methods, roughly half the bar.
 - **Clock requests round up to a 15 MHz grid** on this card. Bin width is a
   per-driver, per-device property — the tool asks the device rather than assuming.
+- **A recommended clock does not survive a driver upgrade.** The same sweep, same
+  workload, same seed, run on 595.71.05 and then 595.84, moved the best point from
+  **1590 MHz to 1560 MHz** and the saving from **29.6% to 33.2%**. Every clock got
+  1.5–3.5% cheaper, most in the middle of the range. A tool that shipped "set this
+  card to 1590" would have been wrong within one unattended upgrade. This is the
+  clearest argument for measuring rather than looking a number up.
 
-The specific percentages above were measured on driver 595.71.05 and are pending
-re-verification on 595.84. Run the tool rather than citing them.
+Percentages here move with driver, workload and hardware. Run the tool rather than
+citing them.
 
 Full detail, with the caveats attached and the reproduction commands, is in
 [docs/findings.md](docs/findings.md).

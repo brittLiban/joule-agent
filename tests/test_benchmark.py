@@ -263,3 +263,144 @@ def test_the_power_axis_is_not_exposed():
     flags = build_arg_parser().format_help()
     assert "--power-limits-w" not in flags
     assert "power-limit" not in flags
+
+
+# ---------------------------------------------------------------------------
+# Privilege handling
+# ---------------------------------------------------------------------------
+
+
+def test_chown_back_never_walks_a_directory(tmp_path, monkeypatch):
+    """`--out` is caller-supplied and this runs as ROOT.
+
+    An earlier version chowned `path.rglob("*")`, so `sudo joule benchmark
+    --out /etc` would have handed /etc to the invoking user. sweep.py's
+    _chown_to_invoking_user already documented both this and the symlink case;
+    this function was written without reading it.
+
+    Mutation: restore the rglob walk and this fails, because the child appears
+    in the chown calls.
+    """
+    from joule_agent import benchmark
+
+    (tmp_path / "child.json").write_text("{}")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "deep.csv").write_text("x")
+
+    calls = []
+    monkeypatch.setattr(benchmark.os, "chown",
+                        lambda p, u, g, follow_symlinks=True: calls.append(p))
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.setenv("SUDO_GID", "1000")
+
+    benchmark._chown_back(tmp_path)
+
+    assert calls == [tmp_path], f"walked into the directory: {calls}"
+
+
+def test_chown_back_does_not_follow_symlinks(tmp_path, monkeypatch):
+    """A symlink planted in the output directory must not be chowned through.
+
+    Mutation: drop follow_symlinks=False and this fails.
+    """
+    from joule_agent import benchmark
+
+    seen = []
+    monkeypatch.setattr(
+        benchmark.os, "chown",
+        lambda p, u, g, follow_symlinks=True: seen.append(follow_symlinks))
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.setenv("SUDO_GID", "1000")
+
+    benchmark._chown_back(tmp_path / "anything")
+
+    assert seen == [False], seen
+
+
+def test_chown_back_is_a_no_op_without_sudo(tmp_path, monkeypatch):
+    """Outside sudo there is no invoking user to hand anything back to, and
+    chowning would be both wrong and a privilege error."""
+    from joule_agent import benchmark
+
+    calls = []
+    monkeypatch.setattr(benchmark.os, "chown",
+                        lambda *a, **k: calls.append(a))
+    monkeypatch.delenv("SUDO_UID", raising=False)
+    monkeypatch.delenv("SUDO_GID", raising=False)
+
+    benchmark._chown_back(tmp_path, tmp_path / "x.json")
+
+    assert calls == []
+
+
+def test_the_sweep_path_actually_renders_the_benchmark_report(tmp_path, monkeypatch):
+    """The renderer must be REACHED, not merely correct.
+
+    format_benchmark_report had six passing tests and was called by nothing --
+    the sweep path shelled out to sweep.main(), which prints its own table, so
+    the tool's headline output was dead code. Tests that invoke a renderer
+    directly prove it works; they do not prove anything uses it.
+
+    Mutation: drop the render call from main() and this fails.
+    """
+    from joule_agent import benchmark
+
+    doc = {
+        "preset": "bursty", "seed": 1234, "schedule_digest": "cdc07a267dc0015c",
+        "repeats": 3, "slo_threshold_s": 0.6647,
+        "slo_threshold_source": "explicit --slo-ms 664.7",
+        "best_point": "clk1590", "tied_points": [], "stock_drift_pct": 0.4,
+        "aborted": False, "warnings": [],
+        "summaries": [
+            {"name": "stock", "runs": 3, "joules_per_token_mean": 0.2146,
+             "joules_per_token_stdev": 0.001, "tokens_per_s_mean": 595.3,
+             "latency_p99_mean_s": 0.6043, "slo_violation_rate_mean": 0.0,
+             "achieved_clock_median_mhz": 1920},
+            {"name": "clk1590", "runs": 3, "joules_per_token_mean": 0.1510,
+             "joules_per_token_stdev": 0.001, "tokens_per_s_mean": 592.7,
+             "latency_p99_mean_s": 0.6593, "slo_violation_rate_mean": 0.0,
+             "achieved_clock_median_mhz": 1590},
+        ],
+    }
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    def fake_sweep_main(argv):
+        (out_dir / "sweep.json").write_text(json.dumps(doc))
+        return 0
+
+    monkeypatch.setattr("joule_agent.sweep.main", fake_sweep_main)
+    monkeypatch.setattr("joule_agent.benchmark._has_root", lambda: True)
+
+    printed = []
+    monkeypatch.setattr("builtins.print",
+                        lambda *a, **k: printed.append(" ".join(str(x) for x in a)))
+
+    rc = benchmark.main(["--model", "m", "--preset", "bursty", "--slo-ms", "664.7",
+                         "--clocks", "1590", "--out", str(out_dir),
+                         "--i-understand-this-changes-gpu-settings"])
+    assert rc == 0
+    joined = "\n".join(printed)
+    assert "JOULE BENCHMARK" in joined, "the benchmark report was never rendered"
+    assert "THIS RUN MEASURED" in joined
+    assert "29.6% lower energy per token" in joined
+
+
+def test_a_render_failure_does_not_fail_a_completed_measurement(tmp_path, monkeypatch):
+    """Mutation: let the render exception propagate and a finished sweep that
+    already cost GPU time comes back as a failure."""
+    from joule_agent import benchmark
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    def fake_sweep_main(argv):
+        (out_dir / "sweep.json").write_text("{ not json")
+        return 0
+
+    monkeypatch.setattr("joule_agent.sweep.main", fake_sweep_main)
+    monkeypatch.setattr("joule_agent.benchmark._has_root", lambda: True)
+    rc = benchmark.main(["--model", "m", "--preset", "bursty", "--slo-ms", "664.7",
+                         "--clocks", "1590", "--out", str(out_dir),
+                         "--i-understand-this-changes-gpu-settings"])
+    assert rc == 0

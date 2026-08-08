@@ -19,12 +19,26 @@ Energy per token is **monotone in clock** across the full tested range
 That makes the answer a property of your budget, not of the hardware — which is
 why the tool measures rather than ships a recommended clock.
 
-| | J / generated token | p99 | achieved MHz |
-|---|---|---|---|
-| stock | 0.21463 | 604 ms | 1920 |
-| tuned static | 0.15103 | 659 ms | 1590 |
+| driver | stock J/tok | tuned J/tok | best clock | saving | p99 |
+|---|---|---|---|---|---|
+| 595.71.05 | 0.21463 | 0.15103 | 1590 MHz | −29.6% | 659 ms |
+| 595.84 | 0.21131 | 0.14125 | **1560 MHz** | **−33.2%** | 664 ms |
 
-**−29.6% at +9.1% p99**, budget 664.4 ms, `bursty` preset, 3 repeats, 60 s runs.
+`bursty`, seed 1234, 3 repeats, 60 s runs, identical schedule digest, budgets
+664.4 and 664.7 ms.
+
+**The knee moved two bins across a driver upgrade, and the whole curve shifted
+down.** Matched point by point, 595.84 is cheaper everywhere — 1.5% at stock,
+1.8–3.5% at the locked clocks — and the improvement is *structured*, largest in
+the middle of the range and smaller at both edges. Prior cross-session drift on
+this box was stock +0.75% / clk1650 +1.39%, so this is 2–5x larger and has a
+shape noise does not.
+
+At n=1 on the new driver this cannot fully separate a driver effect from session
+drift. It does not need to for the conclusion that matters: **a recommended clock
+is not portable across driver versions**, which is the strongest available
+argument that the product is the procedure and not the number. Caveat on the
+comparison: the 595.84 session's stock was noisier (J/token stdev 1.7% vs 0.5%).
 
 Clock requests **round up to a 15 MHz grid** on this card (1580 → 1590,
 1595 → 1605). Verified under load at 100% utilisation; an idle probe would prove

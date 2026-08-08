@@ -296,6 +296,7 @@ class SweepRunner:
         metrics_reader=None,
         clock=time.monotonic,
         sleep=time.sleep,
+        progress=None,
     ) -> None:
         if schedule.reproducible is False:
             raise SweepError(
@@ -327,6 +328,7 @@ class SweepRunner:
         self._load_runner = load_runner or self._default_load_runner
         self._gpu_sampler = gpu_sampler
         self._metrics_reader = metrics_reader or self._default_metrics_reader
+        self._progress = progress
         self._clock = clock
         self._sleep = sleep
 
@@ -553,6 +555,32 @@ class SweepRunner:
 
     # -- the sweep --------------------------------------------------------
 
+    def _report_progress(self, measured, done: int, total: int) -> None:
+        """Emit one line per completed run.
+
+        A sweep is tens of minutes of silence otherwise, and the first thing a
+        new user experiences is wondering whether they have hung something. The
+        line carries the numbers that let an operator abort early on a bad run
+        -- achieved clock, energy per token, p99 -- rather than a bare counter.
+
+        Goes to stderr so that piping stdout to a file still yields only the
+        report. `progress=lambda line: None` silences it.
+        """
+        if self._progress is not None:
+            sink = self._progress
+        else:
+            def sink(line):
+                print(line, file=sys.stderr, flush=True)
+
+        def n(v, spec, scale=1.0):
+            return "n/a" if v is None else format(v * scale, spec)
+
+        run = getattr(measured, "run", measured)
+        sink(f"  [{done:>3}/{total}] {getattr(run, 'point', '?'):<14}"
+             f"clk {n(getattr(run, 'achieved_clock_median_mhz', None), '.0f'):>6} MHz   "
+             f"{n(getattr(run, 'joules_per_generated_token', None), '.5f'):>9} J/tok   "
+             f"p99 {n(getattr(run, 'latency_p99_s', None), '.0f', 1000):>5} ms")
+
     def run(self) -> "SweepResult":
         execution_index = 0
         try:
@@ -573,11 +601,23 @@ class SweepRunner:
             # itself and understates every clock lock.
             for _ in range(self.warmup_runs):
                 self._load_runner(self.schedule)
+            total = self.repeats * len(self.points)
             for round_index in range(self.repeats):
                 for point in self.points:
                     measured = self._run_point(point, round_index, execution_index)
                     self.runs.append(measured)
                     execution_index += 1
+                    try:
+                        self._report_progress(measured, execution_index, total)
+                    except Exception:
+                        # Progress reporting is cosmetic and must never be able
+                        # to void a measurement. The first draft of it raised an
+                        # AttributeError, which run()'s abort handlers caught and
+                        # turned into `aborted=True` -- a display bug discarding
+                        # a sweep that had already touched the GPU. Anything
+                        # inside the measured loop that is not itself a
+                        # measurement gets this treatment.
+                        pass
         except REFUSALS as exc:
             # A refusal usually proves nothing was written, and saying "may
             # still be modified" there would spend the credibility of the one

@@ -1176,3 +1176,46 @@ def test_repeats_below_one_is_refused():
     with pytest.raises(SweepError):
         SweepRunner(endpoint="e", model="m", schedule=sched,
                     points=[SweepPoint()], repeats=0)
+
+
+def test_progress_reporting_cannot_void_a_sweep():
+    """Display code inside the measured loop must not be able to abort it.
+
+    The first version of _report_progress raised an AttributeError, run()'s
+    abort handlers caught it, and every sweep came back aborted with best_point
+    None -- a cosmetic bug discarding measurements that had already cost GPU
+    time. Mutation: remove the try/except around the progress call and this
+    fails.
+    """
+    sched = build_schedule("poisson", seed=7, duration_s=5.0)
+    world = FakeWorld(sched.digest(), latencies=[0.1] * 10)
+
+    def exploding_sink(line):
+        raise RuntimeError("progress sink is broken")
+
+    result = SweepRunner(
+        endpoint="e", model="m", schedule=sched, points=[SweepPoint()],
+        repeats=2, warmup_runs=0, load_runner=world.load_runner,
+        gpu_sampler=FakeSampler(), metrics_reader=world.metrics,
+        sleep=lambda s: None, progress=exploding_sink).run()
+
+    assert not result.aborted, result.abort_reason
+    assert result.best_point == "stock"
+    assert len(result.runs) == 2
+
+
+def test_progress_emits_one_line_per_completed_run():
+    sched = build_schedule("poisson", seed=7, duration_s=5.0)
+    world = FakeWorld(sched.digest(), latencies=[0.1] * 10)
+    lines = []
+    SweepRunner(
+        endpoint="e", model="m", schedule=sched,
+        points=[SweepPoint(), SweepPoint(clock_mhz=1500)], repeats=2,
+        warmup_runs=0, guard_factory=lambda: FakeGuard([]),
+        load_runner=world.load_runner, gpu_sampler=FakeSampler(),
+        metrics_reader=world.metrics, sleep=lambda s: None,
+        progress=lines.append).run()
+
+    assert len(lines) == 4, lines
+    assert "[  1/4]" in lines[0] and "[  4/4]" in lines[-1]
+    assert "stock" in lines[0]

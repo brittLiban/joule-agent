@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 
 from joule_agent.loadgen import PRESETS, build_schedule
+from joule_agent.gpu_guard import DEFAULT_STATE_PATH
 from joule_agent.sweep import (
     DEFAULT_SLO_SLACK,
     MIN_STOCK_RUNS_FOR_SLO,
@@ -72,22 +73,41 @@ def default_out_dir() -> Path:
                                                         time.gmtime())
 
 
-def _chown_back(path: Path) -> None:
-    """Hand results back to the invoking user after a privileged run.
+def _chown_back(*paths) -> None:
+    """Hand artifacts back to the invoking user after a privileged run.
 
     ``sudo`` sets SUDO_UID/SUDO_GID. Without this, a user who runs
-    ``sudo joule benchmark`` once can never again read or write that directory
-    without sudo -- which is exactly how this repo's own ``results/`` tree
-    became unusable to its unprivileged runs.
+    ``sudo joule benchmark`` once can never again read those files without sudo
+    -- which is exactly how this repo's own ``results/`` tree became unusable to
+    its unprivileged runs.
+
+    The guard STATE FILE matters as much as the results directory and lives
+    outside it. Left root-owned at 0600, ``gpu_guard status`` -- which needs no
+    privilege by design, because it is what an operator runs when they suspect
+    the GPU was left modified -- can no longer read the record and reports
+    "possibly-modified" forever. A recovery signal that always fires is a
+    recovery signal nobody reads.
+
+    NEVER walk a caller-supplied directory to do this. An earlier version of
+    this function chowned ``path.rglob("*")``, which means ``sudo joule
+    benchmark --out /etc`` would have handed /etc to the invoking user, and a
+    symlink planted in the output directory would have been chowned through to
+    its target. ``sweep.py``'s ``_chown_to_invoking_user`` already had both
+    lessons written down; this function was added without reading it. Only
+    EXPLICIT paths this process knows it wrote, and never through a symlink --
+    ``sweep.py`` chowns the artifacts IT wrote, so this handles only the files
+    the benchmark itself creates plus the fixed-location guard state file.
     """
     uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
     if uid is None or gid is None:
         return
-    try:
-        for p in [path, *path.rglob("*")]:
-            os.chown(p, int(uid), int(gid))
-    except OSError:
-        pass  # best effort: a results file we cannot chown is still readable data
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            os.chown(Path(path), int(uid), int(gid), follow_symlinks=False)
+        except OSError:
+            pass  # best effort: a file we cannot chown is still readable data
 
 
 def calibrate_slo(*, endpoint, model, schedule, repeats, slo_slack, gpu,
@@ -361,7 +381,8 @@ def main(argv=None) -> int:
                    "calibration": {k: v for k, v in (calib or {}).items()
                                    if k != "result"}}
         (out_dir / "calibration.json").write_text(json.dumps(payload, indent=2))
-        _chown_back(out_dir)
+        _chown_back(out_dir / "calibration.json", out_dir,
+                    DEFAULT_STATE_PATH)
         print(f"\nlatency budget: {slo_ms:.1f} ms")
         print(f"written to {out_dir}")
         print("\nRe-run without --calibrate-only (as root) to sweep clocks, "
@@ -393,12 +414,71 @@ def main(argv=None) -> int:
         "--i-understand-this-changes-gpu-settings",
     ]
     rc = _sweep.main(argv_rest)
-    _chown_back(out_dir)
+    _chown_back(out_dir, DEFAULT_STATE_PATH)
 
     sweep_json = out_dir / "sweep.json"
-    if rc == 0 and sweep_json.exists():
-        print(f"\nfull report: {sweep_json}")
+    if sweep_json.exists():
+        try:
+            print(format_benchmark_report(
+                _result_from_json(sweep_json), calib=calib,
+                driver=_driver_version(), model=args.model,
+                endpoint=args.endpoint))
+        except Exception as exc:                       # noqa: BLE001
+            # Rendering must never turn a completed measurement into a failure.
+            print(f"(could not render the summary: {exc})", file=sys.stderr)
+        print(f"full detail: {sweep_json}")
     return rc
+
+
+class _JsonSummary:
+    """Adapts one summary dict from sweep.json to the attribute access the
+    report renderer expects."""
+
+    def __init__(self, d):
+        self.name = d.get("name")
+        self.runs = d.get("runs")
+        self.joules_per_token_mean = d.get("joules_per_token_mean")
+        self.joules_per_token_stdev = d.get("joules_per_token_stdev")
+        self.tokens_per_s_mean = d.get("tokens_per_s_mean")
+        self.latency_p99_mean_s = d.get("latency_p99_mean_s")
+        self.slo_violation_rate_mean = d.get("slo_violation_rate_mean")
+        self.achieved_clock_median_mhz = d.get("achieved_clock_median_mhz")
+        self.meets_slo = d.get("meets_slo")
+        self.axis_verified = d.get("axis_verified", True)
+        self.tied_with_best = d.get("tied_with_best", False)
+
+
+class _JsonResult:
+    def __init__(self, d):
+        for k in ("preset", "seed", "schedule_digest", "repeats",
+                  "slo_threshold_s", "slo_threshold_source", "best_point",
+                  "tied_points", "stock_drift_pct", "aborted", "abort_reason",
+                  "hardware_may_be_modified", "warnings"):
+            setattr(self, k, d.get(k))
+        self.tied_points = self.tied_points or []
+        self.warnings = self.warnings or []
+        self.summaries = [_JsonSummary(s) for s in d.get("summaries", [])]
+
+
+def _result_from_json(path) -> "_JsonResult":
+    """Read a finished sweep back for rendering.
+
+    The sweep is run as a subprocess-style call so it keeps sole ownership of
+    the guard and the write path; its artifact is the interface. Rendering from
+    the artifact rather than from in-memory state also means the summary a user
+    reads is generated from the same bytes an auditor would read.
+    """
+    return _JsonResult(json.loads(Path(path).read_text()))
+
+
+def _driver_version():
+    try:
+        import pynvml as n
+        n.nvmlInit()
+        v = n.nvmlSystemGetDriverVersion()
+        return v.decode() if isinstance(v, bytes) else v
+    except Exception:
+        return None
 
 
 def _default_clock_grid(gpu: int) -> list:
