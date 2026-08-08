@@ -1310,6 +1310,14 @@ def main(argv=None) -> int:
     p.add_argument("--preset", default="poisson",
                    help="open-loop preset; closed-loop presets are refused")
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--rate-scale", type=float, default=1.0,
+                   help="multiply the preset's arrival rate. The schedule is "
+                        "still built ONCE and replayed at every point, so the "
+                        "identity contract is unchanged -- this only chooses "
+                        "which schedule. Needed because occupancy, not clock, "
+                        "is the largest energy term measured on this box: at "
+                        "rate-scale 1.0 `bursty` runs the card at roughly a "
+                        "tenth of its demonstrated throughput.")
     p.add_argument("--duration", type=float, default=60.0)
     p.add_argument("--clocks", default="",
                    help="MHz list '900,1200,1500' or range 'MIN:MAX:STEP'. "
@@ -1426,7 +1434,9 @@ def main(argv=None) -> int:
               f"`sudo chown -R $USER {out_dir.parents[-2]}`.", file=sys.stderr)
         return 2
 
-    schedule = build_schedule(args.preset, seed=args.seed, duration_s=args.duration)
+    schedule = build_schedule(args.preset, seed=args.seed,
+                              duration_s=args.duration,
+                              rate_scale=args.rate_scale)
 
     guard_factory = None
     sampler = None

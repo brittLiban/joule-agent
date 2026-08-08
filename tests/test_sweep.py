@@ -539,6 +539,23 @@ def test_slo_threshold_is_derived_from_stock_p99_and_says_so():
     assert "stock median p99" in result.slo_threshold_source
 
 
+def test_rate_scale_selects_a_different_schedule_but_keeps_it_singular():
+    """--rate-scale changes WHICH schedule is built, never how many.
+
+    The sweep's whole comparability argument is that one Schedule object is
+    built once and replayed at every point. A rate knob is only safe if it acts
+    before that construction. Mutation: rebuild the schedule per point and the
+    digests diverge, which the runner already treats as a voided sweep.
+    """
+    a = build_schedule("bursty_heavy", seed=1234, duration_s=5.0)
+    b = build_schedule("bursty_heavy", seed=1234, duration_s=5.0, rate_scale=3.0)
+    assert a.digest() != b.digest(), "rate_scale did not change the schedule"
+    again = build_schedule("bursty_heavy", seed=1234, duration_s=5.0,
+                           rate_scale=3.0)
+    assert b.digest() == again.digest(), "scaled schedule is not reproducible"
+    assert len(b.requests) > len(a.requests), "3x rate produced no more arrivals"
+
+
 def test_an_undersampled_derived_slo_warns_and_records_its_own_error():
     """The threshold decides every verdict, so its sampling error is recorded.
 
