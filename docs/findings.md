@@ -287,14 +287,24 @@ Each oracle leg against that curve at **its own** p99:
 | 678 ms | 0.14628 | 0.14589 | **+0.26%** |
 | 692 ms | 0.14621 | outside curve | not comparable |
 
-**Mean −0.07% against a −10% bar.**
+**Mean −0.07% over n=2, against a −10% bar.**
 
-The idle-gap oracle sits *on* the static energy–latency frontier, not below it.
-Whatever it saves by idling in gaps, it repays in tail latency — and spending
-that same latency by simply selecting a lower static clock buys at least as
-much. This is a stronger negative than "short of the bar": with perfect
-foresight and zero prediction error, the mechanism produces **no separation from
-the baseline it was built to beat**.
+**Read that as n=2, because it is.** The 691.7 ms leg fell outside a static curve
+ending at 683 ms and was excluded rather than extrapolated — extrapolating would
+have invented the comparator. A rerun with a ladder extending past every oracle
+leg (`--exact-clocks 1560,1515,1470,1440`) is outstanding, and the wording here
+will be revisited when it lands.
+
+**The load-bearing finding does not depend on that interpolation at all:** the
+oracle's p99 rose 663 → 680 ms and **failed the frozen 664.7 ms budget**. That
+rests on three paired legs and is the robust half of this result.
+
+What the evidence supports: the idle-gap oracle buys its energy with tail
+latency, and at matched latency shows no advantage large enough to resolve at
+this sample size. It does **not** yet support a confident "exactly zero", nor
+the stronger phrasing an earlier version of this page used ("produces no
+separation from the baseline it was built to beat"). Two independent reviews
+(test-integrity, measurement-skeptic) remain outstanding on this claim.
 
 Reproduce with `tools/oracle_idle.py --exact-clocks 1560,1530,1500`.
 

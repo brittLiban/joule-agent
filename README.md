@@ -150,19 +150,23 @@ time, in ~2.5-second stretches. NVIDIA's own governor does not downclock into it
 sustained idle — but under traffic it reaches only ~5% of the theoretical saving. The
 governor descends at sustained idle, not inside 2.5-second gaps.
 
-**Perfect foresight doesn't capture it either.** We built a physically realizable oracle
-that reads the schedule in advance and upclocks *before* each burst arrives — something
-no real controller can do. Against the static baseline it looked like a 2.74% win, until
-you notice its p99 rose 17 ms and it failed the latency budget. Compared at *equal p99*
-against a static curve measured in the same session: **−0.07%**.
+**Perfect foresight doesn't obviously capture it either.** We built a physically
+realizable oracle that reads the schedule in advance and upclocks *before* each burst
+arrives — something no real controller can do. Against the static baseline it looked like
+a 2.74% win, **until you check its latency: p99 rose 663 → 680 ms and it failed the
+664.7 ms budget it was measured under.** That part rests on three paired legs and does not
+depend on any interpolation.
 
-The idle-gap oracle sits **on** the static energy–latency frontier, not below it. What it
-saves by idling in gaps, it repays in tail latency — and spending that same latency by
-simply choosing a lower static clock buys at least as much.
+Compared at *equal* p99 against a static curve measured in the same session, the two
+comparable legs came out **−0.40% and +0.26%**. A third oracle leg at 691.7 ms fell
+outside a static curve ending at 683 ms and was excluded rather than extrapolated, so this
+is n=2 and we are not claiming more than that.
 
-That's a stronger negative than "it fell short." With perfect information and zero
-prediction error, the mechanism produces no separation from the baseline it was built to
-beat. There's no engineering gap to close, because there's no gap.
+What the evidence supports today: **the idle-gap oracle buys its energy with tail latency,
+and at matched latency shows no advantage large enough to measure at this sample size.**
+It does not support a confident "exactly zero" — a rerun with a ladder extending past every
+oracle leg is outstanding, and until it lands this is a strong indication rather than a
+closed result.
 
 **One caveat, and it's real:** all of this ran at ~11% of the card's demonstrated
 throughput. A loaded datacenter GPU may behave differently, and that generalization is
