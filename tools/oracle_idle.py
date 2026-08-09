@@ -30,12 +30,15 @@ hardware, so warm-up alone is not trusted.
 """
 
 import argparse
+import hashlib
 import json
+import platform
 import statistics as st
 import subprocess
-import threading
+import sys
 import time
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 from joule_agent.loadgen import build_schedule
@@ -153,6 +156,128 @@ def run_leg(args, plan, label):
     }
 
 
+def provenance(args, low, schedule):
+    """Everything needed to know what produced a number, recorded with it.
+
+    An artifact without this cannot be audited later: the analysis code changes,
+    the driver changes, the session changes, and a bare JSON of results silently
+    becomes unattributable. `sweep.py` has recorded this since component 4 and
+    these tools did not.
+    """
+    def sha(path):
+        try:
+            return hashlib.sha256(Path(path).read_bytes()).hexdigest()[:16]
+        except OSError:
+            return None
+
+    def sh(cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=10).stdout.strip() or None
+        except Exception:
+            return None
+
+    drv = uuid = None
+    try:
+        import pynvml as n
+        n.nvmlInit()
+        h = n.nvmlDeviceGetHandleByIndex(args.gpu)
+        drv = n.nvmlSystemGetDriverVersion()
+        drv = drv.decode() if isinstance(drv, bytes) else drv
+        uuid = n.nvmlDeviceGetUUID(h)
+        uuid = uuid.decode() if isinstance(uuid, bytes) else uuid
+    except Exception:
+        pass
+
+    return {
+        "utc": datetime.now(timezone.utc).isoformat(),
+        "tool": "tools/oracle_idle.py",
+        "tool_sha256": sha("tools/oracle_idle.py"),
+        "gpu_guard_sha256": sha("joule_agent/gpu_guard.py"),
+        "loadgen_sha256": sha("joule_agent/loadgen.py"),
+        "git_sha": sh(["git", "rev-parse", "HEAD"]),
+        "git_dirty": bool(sh(["git", "status", "--porcelain"])),
+        "argv": sys.argv,
+        "driver_version": drv,
+        "device": {"index": args.gpu, "uuid": uuid},
+        "endpoint": args.endpoint,
+        "model_reported_by_server": sh(
+            ["curl", "-s", "-m", "5", f"{args.endpoint}/v1/models"])[:400]
+        if sh(["curl", "-s", "-m", "5", f"{args.endpoint}/v1/models"]) else None,
+        "schedule_digest": schedule.digest(),
+        "preset": args.preset, "seed": args.seed,
+        "duration_s": args.duration, "high_mhz": args.high, "low_mhz": low,
+        "lead_s": args.lead, "drain_s": args.drain,
+        "exact_clocks": args.exact_clocks, "warmup_s": args.warmup,
+        "python": platform.python_version(), "host": platform.node(),
+    }
+
+
+def analyse(rows):
+    """Pure analysis of measured legs. No I/O, so it can be tested.
+
+    Split out of ``main`` because it was not: a use-before-assignment of
+    ``ladder_mode`` shipped in a version that had been exercised only on a
+    non-ladder run, and nothing could have caught it without a GPU. Analysis
+    that decides a published claim has to be reachable from a unit test.
+
+    Returns a dict; ``iso`` is the load-bearing field in ladder mode.
+    """
+    ex = [r for r in rows if r["label"].startswith("exact")]
+    orc = [r for r in rows if r["label"] == "oracle"]
+    n = min(len(ex), len(orc))
+    deltas = [100 * (orc[i]["j_per_gen_token"] - ex[i]["j_per_gen_token"])
+              / ex[i]["j_per_gen_token"] for i in range(n)]
+
+    # A ladder means the static legs are DIFFERENT configurations on purpose.
+    ladder_mode = len({r["label"] for r in ex}) > 1
+
+    # The cold-first-pair guard uses repeated exact legs as their own control,
+    # so it only means anything when they are the same configuration. In ladder
+    # mode it fires on the ladder itself.
+    excluded = None
+    if not ladder_mode and len(ex) >= 3:
+        later = st.median([r["j_per_gen_token"] for r in ex[1:]])
+        drift = 100 * (ex[0]["j_per_gen_token"] - later) / later
+        if abs(drift) > 1.0:
+            excluded, deltas = drift, deltas[1:]
+
+    # Leg-adjacent deltas also stop meaning anything in ladder mode: each pair
+    # would compare the oracle against a different static clock.
+    dj = st.mean(deltas) if deltas and not ladder_mode else float("nan")
+    dp = (st.mean(r["p99_s"] for r in orc) - st.mean(r["p99_s"] for r in ex)
+          if ex and orc else float("nan"))
+
+    # ISO-p99: what does STATIC cost at the latency the oracle actually
+    # delivered? "Both pass the SLO" credits a policy for energy it bought with
+    # latency. Compare EACH oracle leg at ITS OWN p99 -- averaging p99 first
+    # lets one long leg drag the comparison to a latency no leg ran at.
+    # Interpolate only; never extrapolate, which would invent the comparator.
+    iso, per_leg = None, []
+    if ladder_mode and ex and orc:
+        pts = sorted((r["p99_s"], r["j_per_gen_token"]) for r in ex)
+        for r in orc:
+            po, jo = r["p99_s"], r["j_per_gen_token"]
+            if po < pts[0][0] or po > pts[-1][0]:
+                per_leg.append({"p99_s": po, "oracle_j": jo,
+                                "out_of_range": True})
+                continue
+            for a, b in zip(pts, pts[1:]):
+                if a[0] <= po <= b[0]:
+                    f = (po - a[0]) / (b[0] - a[0]) if b[0] > a[0] else 0.0
+                    js = a[1] + f * (b[1] - a[1])
+                    per_leg.append({"p99_s": po, "oracle_j": jo, "static_j": js,
+                                    "delta_pct": 100 * (jo - js) / js})
+                    break
+        ok = [x for x in per_leg if "delta_pct" in x]
+        iso = {"per_leg": per_leg, "n": len(ok),
+               "delta_pct": st.mean(x["delta_pct"] for x in ok) if ok else None,
+               "curve_p99_s": [x[0] for x in pts],
+               "all_out_of_range": not ok}
+    return {"ex": ex, "orc": orc, "deltas": deltas, "excluded": excluded,
+            "dj": dj, "dp": dp, "iso": iso, "ladder_mode": ladder_mode}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--endpoint", default="http://localhost:8000")
@@ -233,58 +358,11 @@ def main(argv=None):
                   f"{r['transitions']} transitions", flush=True)
             time.sleep(10)
 
-    ex = [r for r in rows if r["label"].startswith("exact")]
-    orc = [r for r in rows if r["label"] == "oracle"]
-    deltas = [100 * (orc[i]["j_per_gen_token"] - ex[i]["j_per_gen_token"])
-              / ex[i]["j_per_gen_token"] for i in range(min(len(ex), len(orc)))]
-
-    # ISO-p99: what does STATIC cost at the latency the oracle actually
-    # delivered? "Both pass the SLO" credits a policy for energy it bought with
-    # latency. Interpolate the in-session static curve, never extrapolate.
-    # Compare EACH oracle leg against the static curve at ITS OWN p99, rather
-    # than mean-against-mean. Oracle p99 varies leg to leg (678-692 ms observed),
-    # and averaging first lets one long leg drag the comparison to a latency no
-    # leg actually ran at -- which also pushed the mean outside the curve and
-    # produced a spurious "extrapolation impossible".
-    iso, per_leg = None, []
-    if ladder_mode:
-        pts = sorted((r["p99_s"], r["j_per_gen_token"]) for r in ex)
-        for r in orc:
-            po, jo = r["p99_s"], r["j_per_gen_token"]
-            if po < pts[0][0] or po > pts[-1][0]:
-                per_leg.append({"p99_s": po, "oracle_j": jo,
-                                "out_of_range": True})
-                continue
-            for a, b in zip(pts, pts[1:]):
-                if a[0] <= po <= b[0]:
-                    f = (po - a[0]) / (b[0] - a[0]) if b[0] > a[0] else 0
-                    js = a[1] + f * (b[1] - a[1])
-                    per_leg.append({"p99_s": po, "oracle_j": jo, "static_j": js,
-                                    "delta_pct": 100 * (jo - js) / js})
-                    break
-        ok = [x for x in per_leg if "delta_pct" in x]
-        if ok:
-            iso = {"per_leg": per_leg, "n": len(ok),
-                   "delta_pct": st.mean(x["delta_pct"] for x in ok),
-                   "curve_p99_s": [x[0] for x in pts]}
-
-    # The cold-first-pair guard uses repeated EXACT legs as their own control,
-    # so it is only meaningful when those legs are the same configuration. With
-    # a --exact-clocks ladder they are deliberately different, and the guard
-    # fires on the ladder itself (it reported "+2.9% vs later ones" for a 1560
-    # leg against 1530 and 1500 legs, which is the ladder working as designed).
-    ladder_mode = len({r["label"] for r in ex}) > 1
-    excluded = None
-    if not ladder_mode and len(ex) >= 3:
-        later = st.median([r["j_per_gen_token"] for r in ex[1:]])
-        drift = 100 * (ex[0]["j_per_gen_token"] - later) / later
-        if abs(drift) > 1.0:
-            excluded, deltas = drift, deltas[1:]
-    # Leg-adjacent deltas also stop meaning anything in ladder mode: each pair
-    # would compare the oracle against a DIFFERENT static clock. Iso-p99 below
-    # is the comparison in that mode; this one is suppressed.
-    dj = st.mean(deltas) if not ladder_mode else float("nan")
-    dp = st.mean(r["p99_s"] for r in orc) - st.mean(r["p99_s"] for r in ex)
+    a = analyse(rows)
+    ex, orc = a["ex"], a["orc"]
+    deltas, excluded, dj, dp, iso = (a["deltas"], a["excluded"], a["dj"],
+                                     a["dp"], a["iso"])
+    ladder_mode = a["ladder_mode"]
 
     print(f"\n{'=' * 68}")
     print("paired energy delta: " + "  ".join(f"{d:+.2f}%" for d in deltas)
@@ -294,7 +372,7 @@ def main(argv=None):
     print(f"p99 delta: {dp * 1000:+.0f} ms")
     print("=" * 68)
 
-    if iso:
+    if iso and not iso["all_out_of_range"]:
         print("ISO-p99, each oracle leg against the in-session static curve:")
         for x in iso["per_leg"]:
             if "delta_pct" in x:
@@ -319,7 +397,7 @@ def main(argv=None):
                   "the 10% bar.")
         else:
             print("CLEARS the bar at equal p99. Build the causal controller.")
-    elif ladder_mode:
+    elif iso and iso["all_out_of_range"]:
         print("NO COMPARABLE LEG. Every oracle leg fell outside the static")
         print("curve, so there is nothing to compare against without inventing")
         print("a comparator. Widen --exact-clocks.")
@@ -339,11 +417,13 @@ def main(argv=None):
 
     if args.out:
         Path(args.out).write_text(json.dumps(
-            {"high": args.high, "low": low, "lead": args.lead,
+            {"provenance": provenance(args, low, sched),
+             "high": args.high, "low": low, "lead": args.lead,
              "drain": args.drain, "digest": sched.digest(),
              "bursts": len(windows), "plan": plan, "deltas": deltas,
-             "mean_delta_pct": dj, "p99_delta_s": dp, "iso_p99": iso,
-             "legs": rows}, indent=2))
+             "ladder_mode": ladder_mode, "excluded_pair_pct": excluded,
+             "mean_delta_pct": None if dj != dj else dj,
+             "p99_delta_s": dp, "iso_p99": iso, "legs": rows}, indent=2))
         print(f"\nwritten to {args.out}")
     return 0
 
