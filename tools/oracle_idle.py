@@ -366,7 +366,8 @@ def main(argv=None):
 
     print(f"\n{'=' * 68}")
     print("paired energy delta: " + "  ".join(f"{d:+.2f}%" for d in deltas)
-          + f"  ->  mean {dj:+.2f}%")
+          + ("  ->  suppressed (ladder mode: each pair uses a different static "
+             "clock)" if dj != dj else f"  ->  mean {dj:+.2f}%"))
     if excluded is not None:
         print(f"  pair 1 excluded: exact leg ran {excluded:+.1f}% vs later ones")
     print(f"p99 delta: {dp * 1000:+.0f} ms")

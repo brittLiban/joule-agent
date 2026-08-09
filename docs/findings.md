@@ -287,24 +287,38 @@ Each oracle leg against that curve at **its own** p99:
 | 678 ms | 0.14628 | 0.14589 | **+0.26%** |
 | 692 ms | 0.14621 | outside curve | not comparable |
 
-**Mean −0.07% over n=2, against a −10% bar.**
+**Superseded by a rerun with every leg bracketed. See below.**
 
-**Read that as n=2, because it is.** The 691.7 ms leg fell outside a static curve
-ending at 683 ms and was excluded rather than extrapolated — extrapolating would
-have invented the comparator. A rerun with a ladder extending past every oracle
-leg (`--exact-clocks 1560,1515,1470,1440`) is outstanding, and the wording here
-will be revisited when it lands.
+### The rerun: the oracle is DOMINATED by a static lock
 
-**The load-bearing finding does not depend on that interpolation at all:** the
-oracle's p99 rose 663 → 680 ms and **failed the frozen 664.7 ms budget**. That
-rests on three paired legs and is the robust half of this result.
+The first attempt left one oracle leg (691.7 ms) outside a static curve ending
+at 683 ms, so its −0.07% was a mean over n=2. Rerun with a ladder extending past
+every oracle leg — `--exact-clocks 1560,1515,1470,1440`, four pairs, full
+provenance, on code that had actually been executed after the analysis fixes:
 
-What the evidence supports: the idle-gap oracle buys its energy with tail
-latency, and at matched latency shows no advantage large enough to resolve at
-this sample size. It does **not** yet support a confident "exactly zero", nor
-the stronger phrasing an earlier version of this page used ("produces no
-separation from the baseline it was built to beat"). Two independent reviews
-(test-integrity, measurement-skeptic) remain outstanding on this claim.
+| static | p99 | J/token | | oracle p99 | oracle | static @ that p99 | delta |
+|---|---|---|---|---|---|---|---|
+| 1560 | 665 ms | 0.15016 | | 678 ms | 0.14512 | 0.14601 | **−0.61%** |
+| 1515 | 678 ms | 0.14621 | | 679 ms | 0.14659 | 0.14578 | **+0.55%** |
+| 1470 | 689 ms | 0.14179 | | 680 ms | 0.14641 | 0.14527 | **+0.78%** |
+| 1440 | 699 ms | 0.13857 | | 690 ms | 0.14649 | 0.14163 | **+3.43%** |
+
+**Mean +1.04% over n=4 — the oracle is WORSE than a static lock at the same
+latency**, and three of four legs agree on the sign.
+
+The mechanism is visible in the spans. Across 665–699 ms the static curve trades
+latency for energy over an **8.4%** range. The oracle's energy varies by **1.0%**
+across a 12 ms latency spread — it delivers a near-constant operating point, and
+that point is off the curve.
+
+**Why: the oracle refuses to slow down where the work is.** It holds the tuned
+clock through every burst and harvests only the gaps. But a 42%-idle trace has
+few joules in its gaps and most of them in its bursts, so a static lock that runs
+the *whole* trace slightly slower captures more. Perfect foresight about *when*
+traffic arrives does not help if the policy declines to act during the traffic.
+
+That closes the idle-gap mechanism on this hardware. It is not "short of the 10%
+bar" — it is on the wrong side of zero against the baseline it was built to beat.
 
 Reproduce with `tools/oracle_idle.py --exact-clocks 1560,1530,1500`.
 

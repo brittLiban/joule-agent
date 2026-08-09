@@ -157,16 +157,22 @@ a 2.74% win, **until you check its latency: p99 rose 663 → 680 ms and it faile
 664.7 ms budget it was measured under.** That part rests on three paired legs and does not
 depend on any interpolation.
 
-Compared at *equal* p99 against a static curve measured in the same session, the two
-comparable legs came out **−0.40% and +0.26%**. A third oracle leg at 691.7 ms fell
-outside a static curve ending at 683 ms and was excluded rather than extrapolated, so this
-is n=2 and we are not claiming more than that.
+Compared at *equal* p99 against a static curve measured in the same session — four legs,
+every one bracketed — the oracle came out **+1.04% worse than simply locking to a lower
+clock**, with three of four legs agreeing on the sign.
 
-What the evidence supports today: **the idle-gap oracle buys its energy with tail latency,
-and at matched latency shows no advantage large enough to measure at this sample size.**
-It does not support a confident "exactly zero" — a rerun with a ladder extending past every
-oracle leg is outstanding, and until it lands this is a strong indication rather than a
-closed result.
+The mechanism is visible in the spans. Over 665–699 ms the static curve trades latency for
+energy across an **8.4%** range. The oracle's energy varies **1.0%** across a 12 ms latency
+spread: it delivers one near-constant operating point, and that point is off the curve.
+
+**Why: it refuses to slow down where the work is.** The oracle holds the tuned clock
+through every burst and harvests only the gaps — but a 42%-idle trace keeps most of its
+joules in the bursts. A static lock that runs the whole trace slightly slower captures
+more. Perfect foresight about *when* traffic arrives doesn't help if the policy declines
+to act *during* it.
+
+So this isn't "short of the 10% bar." On this hardware the idle-gap mechanism lands on the
+wrong side of zero against the baseline it was built to beat.
 
 **One caveat, and it's real:** all of this ran at ~11% of the card's demonstrated
 throughput. A loaded datacenter GPU may behave differently, and that generalization is
