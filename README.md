@@ -247,6 +247,9 @@ Contributions welcome, especially **measurements on hardware we don't have**. If
 this on a datacenter GPU, the results are interesting whichever way they come out —
 including, especially, if they contradict what's above.
 
+[docs/roadmap.md](docs/roadmap.md) covers what's planned, who can't use this yet and why,
+and which limitations are inherent rather than unbuilt.
+
 ---
 
 ## License
