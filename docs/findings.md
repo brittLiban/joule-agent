@@ -256,6 +256,48 @@ of the same instant.
 
 Reproduce with `tools/oracle_mix.py <sweep-dir>`.
 
+### The idle oracle, run on hardware: it does not beat turning the clock down
+
+The analytical bounds above are superseded by a measurement. `oracle_idle`
+is a perfect-foresight, physically realizable controller: it reads the
+materialized schedule, so it upclocks **before** each burst arrives — something
+no causal policy can do — and drops to 405 MHz in the gaps. One GPU-wide clock
+on a timeline, real writes through the guard, real queue coupling, real energy.
+
+Against `exact-1560` it looked like a win: **−2.74%** energy, three pairs
+agreeing to 0.4 points. But its p99 rose from 663 to 680 ms, which **fails the
+frozen 664.7 ms SLO** — it bought that energy with latency.
+
+So the comparison has to be at equal p99, against a static curve measured in the
+same session. (Not a borrowed one: `exact-1560` read 6.5% apart between two
+sessions on the same driver, which is why cross-session curves cannot serve as
+comparators here.)
+
+| | p99 | J/token |
+|---|---|---|
+| exact 1560 | 666 ms | 0.15029 |
+| exact 1530 | 673 ms | 0.14766 |
+| exact 1500 | 683 ms | 0.14442 |
+
+Each oracle leg against that curve at **its own** p99:
+
+| oracle p99 | oracle | static | delta |
+|---|---|---|---|
+| 679 ms | 0.14514 | 0.14573 | **−0.40%** |
+| 678 ms | 0.14628 | 0.14589 | **+0.26%** |
+| 692 ms | 0.14621 | outside curve | not comparable |
+
+**Mean −0.07% against a −10% bar.**
+
+The idle-gap oracle sits *on* the static energy–latency frontier, not below it.
+Whatever it saves by idling in gaps, it repays in tail latency — and spending
+that same latency by simply selecting a lower static clock buys at least as
+much. This is a stronger negative than "short of the bar": with perfect
+foresight and zero prediction error, the mechanism produces **no separation from
+the baseline it was built to beat**.
+
+Reproduce with `tools/oracle_idle.py --exact-clocks 1560,1530,1500`.
+
 ### What is left
 
 The wide-grid run does establish one real thing: **the static optimum is forced
