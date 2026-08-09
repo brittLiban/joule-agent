@@ -38,9 +38,14 @@ phase0() {
 
   # THE blocker on rented hardware: many container runtimes grant NVML reads and
   # refuse clock writes. Find out in 5 seconds, not after an hour of setup.
-  if sudo nvidia-smi -i 0 -lgc 1200 >/dev/null 2>&1; then
-    sudo nvidia-smi -i 0 -rgc >/dev/null 2>&1 || true
-    ok "clock writes permitted"
+  # Through gpu_guard, NEVER raw nvidia-smi. An earlier version of this script
+  # used `nvidia-smi -lgc` directly, which is exactly what the repo's core rule
+  # forbids -- and worst on a RENTED multi-GPU node, where a crash between -lgc
+  # and -rgc strands a locked card with no state file for the next run to
+  # recover from. The capability probe must be as safe as the measurement.
+  if sudo $PY -m joule_agent.gpu_guard --gpu 0 lock --mhz 1200 --hold 1 \
+       $CONSENT >/dev/null 2>&1; then
+    ok "clock writes permitted (via gpu_guard, restored on exit)"
   else
     no "clock writes REFUSED on this instance. Everything past the calibration
       half is impossible here. You need bare metal or a privileged container --

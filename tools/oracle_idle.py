@@ -96,11 +96,11 @@ def counters(endpoint):
     return gen, pro
 
 
-def energy_j():
+def energy_j(gpu=0):
     import pynvml as n
     n.nvmlInit()
     return n.nvmlDeviceGetTotalEnergyConsumption(
-        n.nvmlDeviceGetHandleByIndex(0)) / 1000.0
+        n.nvmlDeviceGetHandleByIndex(gpu)) / 1000.0
 
 
 def run_leg(args, plan, label):
@@ -119,12 +119,13 @@ def run_leg(args, plan, label):
         time.sleep(2.0)
 
         g0, p0 = counters(args.endpoint)
-        e0 = energy_j()
+        e0 = energy_j(args.gpu)
         t0 = time.monotonic()
 
         proc = subprocess.Popen(
-            [PY, "-m", "joule_agent.loadgen", "--preset", args.preset,
-             "--seed", str(args.seed), "--duration", str(args.duration)],
+            [PY, "-m", "joule_agent.loadgen", "--endpoint", args.endpoint,
+             "--preset", args.preset, "--seed", str(args.seed),
+             "--duration", str(args.duration)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         if plan:
@@ -138,7 +139,7 @@ def run_leg(args, plan, label):
                 applied.append((round(time.monotonic() - t0, 3), clock))
         out, err = proc.communicate(timeout=1800)
 
-        e1 = energy_j()
+        e1 = energy_j(args.gpu)
         g1, p1 = counters(args.endpoint)
         t1 = time.monotonic()
         guard.lock_clocks(args.high)
@@ -315,7 +316,7 @@ def main(argv=None):
     low = args.low
     if low is None:
         import pynvml as n
-        n.nvmlInit(); h = n.nvmlDeviceGetHandleByIndex(0)
+        n.nvmlInit(); h = n.nvmlDeviceGetHandleByIndex(args.gpu)
         low = sorted(n.nvmlDeviceGetSupportedGraphicsClocks(
             h, n.nvmlDeviceGetSupportedMemoryClocks(h)[0]))[0]
 
@@ -333,7 +334,8 @@ def main(argv=None):
 
     if args.warmup > 0:
         print(f"  warming ({args.warmup:.0f}s, discarded) ...", flush=True)
-        subprocess.run([PY, "-m", "joule_agent.loadgen", "--preset", args.preset,
+        subprocess.run([PY, "-m", "joule_agent.loadgen",
+                        "--endpoint", args.endpoint, "--preset", args.preset,
                         "--seed", str(args.seed), "--duration", str(args.warmup)],
                        capture_output=True, text=True, timeout=1800)
         time.sleep(10)

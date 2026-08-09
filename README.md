@@ -174,6 +174,14 @@ to act *during* it.
 So this isn't "short of the 10% bar." On this hardware the idle-gap mechanism lands on the
 wrong side of zero against the baseline it was built to beat.
 
+**Two honest caveats on that result.** This oracle drops the clock a fixed 0.5 s after a
+burst's last *arrival* rather than on observed engine-empty, so it may be manufacturing
+part of the latency penalty it's charged for — the sign near zero is unresolved, though
+the ~4.7% physical ceiling for idle-only reclamation means no timing fix reaches 10%. And
+separately: **state-dependent control during active work remains unmeasured.** An earlier
+5.79% figure has been retracted (it paired latency *ranks*, not requests — see
+[docs/findings.md](docs/findings.md)), so nothing here rules that mechanism in or out.
+
 **One caveat, and it's real:** all of this ran at ~11% of the card's demonstrated
 throughput. A loaded datacenter GPU may behave differently, and that generalization is
 untested.

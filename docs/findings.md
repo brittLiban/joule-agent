@@ -228,16 +228,34 @@ controller gives back power only during a gap it has *detected*, and detection i
 bounded by how fast it can see the engine's state -- **measured at ~37 ms**, not
 the ~500 ms an earlier version of this file claimed. See the correction below.
 
-### Per-request oracle: 5.79%
+### RETRACTED: the "per-request oracle, 5.79%"
 
 Every sweep point replays the same `Schedule` (digest asserted per run), so
 request *i* at one clock and request *i* at another are the **same request** —
 paired observations. That allows an oracle with perfect foresight, per-request
 granularity and zero switching cost, scored entirely from measured data.
 
-Over the clock range where the bound is tight it reaches **−5.79%** against
-tuned static. **An upper bound falling short is the informative case:** no
-controller in that range can do better.
+**This figure is withdrawn. It was never a per-request oracle.**
+
+`loadgen._finalise` calls `sorted(self._latencies)` before storing them, so the
+saved latency vectors are ordered by duration, not by request. `oracle_mix.py`
+indexes position *i* across clocks believing it is the same request; it is the
+*i*-th fastest request at each clock. **It paired ranks, not requests.**
+
+The validity gate built into that tool — "assigning every request to one clock
+reproduces that point's measured p99" — cannot detect this, because sorting does
+not change percentiles. It passed trivially on data that had already lost the
+identity the method depends on. A gate that cannot fail for the reason it exists
+is not a gate.
+
+A second, independent problem: the tool assigns a whole-run average J/token to
+individual requests, but concurrent requests share batches and GPU energy does
+not decompose per request.
+
+**What this does and does not change.** The active-work opportunity is now
+*unmeasured*, not measured-and-small. It was never a valid upper bound and must
+not be cited as one. Recovering it requires preserving request identity through
+the load generator — a real change, not a reanalysis.
 
 **The bound is only valid over a narrow clock range, and the tool now checks
 this.** One clock applies to the whole GPU; under continuous batching a
@@ -320,7 +338,22 @@ traffic arrives does not help if the policy declines to act during the traffic.
 That closes the idle-gap mechanism on this hardware. It is not "short of the 10%
 bar" — it is on the wrong side of zero against the baseline it was built to beat.
 
-Reproduce with `tools/oracle_idle.py --exact-clocks 1560,1530,1500`.
+Reproduce with `tools/oracle_idle.py --exact-clocks 1560,1515,1470,1440`.
+
+**Known weakness in this oracle, and it cuts against the result.** The policy
+downclocks a fixed `--drain` (0.5 s) after the last *arrival* of a burst. It
+never checks the project's own idle condition, `running == 0 && waiting == 0`.
+With p99 near 665 ms, requests can still be decoding when the clock drops — so
+the oracle may be manufacturing part of the latency penalty it is then charged
+for. A true engine-empty oracle (downclock only on observed empty, keep
+foresight only for the pre-arrival upclock) would be a fairer test and would
+likely move the result toward zero or negative.
+
+It would not change the conclusion. The independent physical ceiling for
+idle-only reclamation on this workload is ~4.7% with zero switching cost, so a
+better-timed oracle cannot turn this into a >10% mechanism. But the published
+sign is not settled, and the honest reading is: **this fixed-drain policy is
+nowhere near the bar; its exact sign near zero is unresolved.**
 
 ### What is left
 
